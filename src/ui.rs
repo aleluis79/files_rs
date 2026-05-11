@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::{DateTime, Local};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -13,6 +13,7 @@ use crate::{
 pub fn render(frame: &mut Frame, app: &App) {
     if let AppMode::Viewer(viewer) = &app.mode {
         render_viewer(frame, viewer, &app.status_message);
+        render_mkdir_input(frame, app);
         render_rename_input(frame, app);
         render_confirmation(frame, app);
         render_help(frame, app);
@@ -28,7 +29,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    let header = Paragraph::new("Norton Commander RS")
+    let header = Paragraph::new("Files RS")
         .style(
             Style::default()
                 .fg(Color::Yellow)
@@ -49,6 +50,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         &app.left,
         app.active_panel == ActivePanel::Left,
         "Izquierda",
+        app.marquee_tick,
     );
     render_panel(
         frame,
@@ -56,6 +58,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         &app.right,
         app.active_panel == ActivePanel::Right,
         "Derecha",
+        app.marquee_tick,
     );
 
     let current = app.active_panel();
@@ -64,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F3 Ver F5 Copiar F6 Renombrar F8 Borrar F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -76,12 +79,45 @@ pub fn render(frame: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Estado"));
     frame.render_widget(footer, layout[2]);
 
+    render_mkdir_input(frame, app);
     render_rename_input(frame, app);
     render_confirmation(frame, app);
     render_help(frame, app);
 }
 
-fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelState, is_active: bool, title: &str) {
+fn render_mkdir_input(frame: &mut Frame, app: &App) {
+    let Some(dialog) = &app.mkdir_input else {
+        return;
+    };
+
+    let area = centered_rect(frame.area(), 68, 28);
+    let content = format!(
+        "Base: {}\n\nNombre o ruta de directorio:\n{}\n\nEnter confirmar, Esc cancelar, Backspace borrar",
+        dialog.base_dir.display(),
+        dialog.input
+    );
+
+    let overlay = Paragraph::new(content)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightGreen))
+                .title("F7 Crear Directorio"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(overlay, area);
+}
+
+fn render_panel(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &PanelState,
+    is_active: bool,
+    title: &str,
+    marquee_tick: u64,
+) {
     let border_style = if is_active {
         Style::default()
             .fg(Color::Green)
@@ -93,10 +129,10 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelState, is_active: bo
     let visible_rows = area.height.saturating_sub(2) as usize;
     let start_index = if visible_rows == 0 {
         0
-    } else if panel.selected >= visible_rows {
-        panel.selected + 1 - visible_rows
     } else {
-        0
+        let half = visible_rows / 2;
+        let max_start = panel.entries.len().saturating_sub(visible_rows);
+        panel.selected.saturating_sub(half).min(max_start)
     };
 
     let items = panel
@@ -123,7 +159,25 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelState, is_active: bo
             } else {
                 Style::default()
             };
-            ListItem::new(format!("{} {} {}", mark, marker, entry.name)).style(style)
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let fixed_without_name = 35usize;
+            let name_width = inner_width.saturating_sub(fixed_without_name).max(6);
+            let selected_active = is_active && index == panel.selected;
+            let name_text = visible_name(&entry.name, name_width, selected_active, marquee_tick);
+            let size_text = if entry.is_dir {
+                "<DIR>".to_string()
+            } else {
+                format_size(entry.size_bytes.unwrap_or(0))
+            };
+            let date_text = entry
+                .modified
+                .map(format_modified)
+                .unwrap_or_else(|| "---- -- -- --:--".to_string());
+            ListItem::new(format!(
+                "{} {} {} {:>9} {}",
+                mark, marker, name_text, size_text, date_text
+            ))
+            .style(style)
         })
         .collect::<Vec<_>>();
 
@@ -134,6 +188,83 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelState, is_active: bo
             .title(format!("{}: {}", title, panel.cwd.display())),
     );
     frame.render_widget(list, area);
+}
+
+fn visible_name(name: &str, width: usize, selected_active: bool, tick: u64) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= width {
+        return format!("{:<width$}", name, width = width);
+    }
+
+    if selected_active {
+        return scrolling_window(&chars, width, tick);
+    }
+
+    truncate_name(&chars, width)
+}
+
+fn truncate_name(chars: &[char], width: usize) -> String {
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+
+    let keep = width - 3;
+    let mut out = chars.iter().take(keep).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn scrolling_window(chars: &[char], width: usize, tick: u64) -> String {
+    let max_offset = chars.len().saturating_sub(width);
+    if max_offset == 0 {
+        return chars.iter().collect();
+    }
+
+    // Faster movement (1 tick per step) with a small pause at both ends.
+    let pause_ticks = 10usize;
+    let move_ticks = max_offset;
+    let cycle = pause_ticks + move_ticks + pause_ticks;
+    let phase = (tick as usize) % cycle;
+
+    let start = if phase < pause_ticks {
+        0
+    } else if phase < pause_ticks + move_ticks {
+        phase - pause_ticks
+    } else {
+        max_offset
+    };
+
+    let mut strip = Vec::with_capacity(chars.len());
+    strip.extend_from_slice(chars);
+    (0..width)
+        .map(|i| strip[(start + i) % strip.len()])
+        .collect()
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1}G", b / GB)
+    } else if b >= MB {
+        format!("{:.1}M", b / MB)
+    } else if b >= KB {
+        format!("{:.1}K", b / KB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn format_modified(time: std::time::SystemTime) -> String {
+    let dt: DateTime<Local> = time.into();
+    dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
 fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) {
@@ -213,8 +344,8 @@ fn render_rename_input(frame: &mut Frame, app: &App) {
 
     let area = centered_rect(frame.area(), 72, 30);
     let content = format!(
-        "Origen: {}\n\nDestino por defecto (Enter): {}\n\nEscriba para cambiar nombre en el directorio actual:\n{}\n\nEnter confirmar, Esc cancelar, Backspace borrar",
-        dialog.source.display(),
+        "Origen: {}\n\nDestino por defecto (Enter): {}\n\nSi hay un solo elemento, escriba para cambiar nombre en el directorio actual:\n{}\n\nEnter confirmar, Esc cancelar, Backspace borrar",
+        dialog.source_label,
         dialog.default_move_dir.display(),
         dialog.input
     );
@@ -245,7 +376,8 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F3  Visualizar archivo de texto/markdown",
         "F5  Copiar al panel opuesto (con confirmacion)",
         "F6  Enter mueve al panel opuesto; escribir cambia nombre",
-        "F8  Borrar (pendiente)",
+        "F7  Crear directorio (con entrada y confirmacion)",
+        "F8  Borrar seleccion (con confirmacion)",
         "F10 Salir (con confirmacion)",
         "",
         "Tab cambia panel activo",

@@ -1,10 +1,11 @@
 mod app;
+mod ops;
 mod ui;
 mod viewer;
 
-use std::{io, time::Duration};
+use std::{fs, io, path::Path, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
@@ -18,7 +19,9 @@ fn main() -> Result<()> {
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal);
     restore_terminal(&mut terminal)?;
-    result
+    let exit_dir = result?;
+    handoff_exit_directory(&exit_dir)?;
+    Ok(())
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -41,13 +44,14 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<std::path::PathBuf> {
     let mut app = App::new()?;
 
     while !app.should_quit {
         let area = terminal.size()?;
         let panel_visible_rows = area.height.saturating_sub(8) as usize;
         app.set_panel_page_size(panel_visible_rows);
+        app.advance_marquee();
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 
@@ -64,5 +68,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         }
     }
 
+    Ok(app.exit_directory())
+}
+
+fn handoff_exit_directory(exit_dir: &Path) -> Result<()> {
+    if let Ok(file_path) = std::env::var("NCRS_CHDIR_FILE") {
+        fs::write(&file_path, format!("{}\n", exit_dir.display()))
+            .with_context(|| format!("No se pudo escribir {}", file_path))?;
+    }
+
+    let quoted = shell_quote(exit_dir);
+    println!("Directorio de salida sugerido: {}", exit_dir.display());
+    println!("Ejecuta en tu shell: cd {}", quoted);
     Ok(())
+}
+
+fn shell_quote(path: &Path) -> String {
+    let raw = path.display().to_string();
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }

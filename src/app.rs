@@ -2,12 +2,16 @@ use std::{
     collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::viewer::ViewerState;
+use crate::{
+    ops::{OverwriteBatchState, OverwriteOperation, apply_batch_operation, remove_path_recursive},
+    viewer::ViewerState,
+};
 
 pub enum AppMode {
     Panels,
@@ -16,8 +20,15 @@ pub enum AppMode {
 
 #[derive(Clone, Debug)]
 pub struct RenameInputDialog {
-    pub source: PathBuf,
+    pub sources: Vec<PathBuf>,
+    pub source_label: String,
     pub default_move_dir: PathBuf,
+    pub input: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MkdirInputDialog {
+    pub base_dir: PathBuf,
     pub input: String,
 }
 
@@ -28,9 +39,20 @@ pub struct RenamePlan {
 }
 
 #[derive(Clone, Debug)]
+pub enum PendingRenamePlan {
+    Single(RenamePlan),
+    Multiple {
+        sources: Vec<PathBuf>,
+        destination_dir: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub enum PendingAction {
     Copy,
     Rename,
+    Mkdir,
+    OverwriteConflict,
     Delete,
     Quit,
 }
@@ -62,6 +84,8 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_executable: bool,
+    pub size_bytes: Option<u64>,
+    pub modified: Option<SystemTime>,
 }
 
 impl FileEntry {
@@ -74,6 +98,8 @@ impl FileEntry {
                 .unwrap_or_else(|| path.to_path_buf()),
             is_dir: true,
             is_executable: false,
+            size_bytes: None,
+            modified: None,
         })
     }
 }
@@ -164,6 +190,21 @@ impl PanelState {
             .collect()
     }
 
+    pub fn operation_directory_count(&self) -> usize {
+        if self.marked.is_empty() {
+            return self
+                .selected_entry()
+                .filter(|entry| entry.name != ".." && entry.is_dir)
+                .map(|_| 1usize)
+                .unwrap_or(0);
+        }
+
+        self.entries
+            .iter()
+            .filter(|entry| entry.name != ".." && entry.is_dir && self.marked.contains(&entry.path))
+            .count()
+    }
+
     pub fn clear_marks(&mut self) {
         self.marked.clear();
     }
@@ -175,10 +216,15 @@ pub struct App {
     pub active_panel: ActivePanel,
     pub mode: AppMode,
     pub panel_page_size: usize,
+    pub marquee_tick: u64,
     pub show_help: bool,
     pub rename_input: Option<RenameInputDialog>,
-    pub pending_rename: Option<RenamePlan>,
+    pub mkdir_input: Option<MkdirInputDialog>,
+    pub pending_rename: Option<PendingRenamePlan>,
+    pub pending_mkdir: Option<PathBuf>,
+    pub pending_overwrite: Option<OverwriteBatchState>,
     pub confirmation: Option<ConfirmationDialog>,
+    pub exit_dir: Option<PathBuf>,
     pub should_quit: bool,
     pub status_message: String,
 }
@@ -192,16 +238,25 @@ impl App {
             active_panel: ActivePanel::Left,
             mode: AppMode::Panels,
             panel_page_size: 10,
+            marquee_tick: 0,
             show_help: false,
             rename_input: None,
+            mkdir_input: None,
             pending_rename: None,
+            pending_mkdir: None,
+            pending_overwrite: None,
             confirmation: None,
+            exit_dir: None,
             should_quit: false,
             status_message: "Listo".to_string(),
         })
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.mkdir_input.is_some() {
+            return self.handle_mkdir_input_key(key);
+        }
+
         if self.rename_input.is_some() {
             return self.handle_rename_input_key(key);
         }
@@ -240,6 +295,7 @@ impl App {
             KeyCode::F(3) => self.preview_selected(),
             KeyCode::F(5) => self.open_confirmation(PendingAction::Copy),
             KeyCode::F(6) => self.open_rename_input(),
+            KeyCode::F(7) => self.open_mkdir_input(),
             KeyCode::F(8) => self.open_confirmation(PendingAction::Delete),
             _ => {}
         }
@@ -293,6 +349,16 @@ impl App {
 
     pub fn set_panel_page_size(&mut self, page_size: usize) {
         self.panel_page_size = page_size.max(1);
+    }
+
+    pub fn advance_marquee(&mut self) {
+        self.marquee_tick = self.marquee_tick.wrapping_add(1);
+    }
+
+    pub fn exit_directory(&self) -> PathBuf {
+        self.exit_dir
+            .clone()
+            .unwrap_or_else(|| self.active_panel().cwd.clone())
     }
 
     fn open_selected(&mut self) -> Result<()> {
@@ -400,6 +466,7 @@ impl App {
             KeyCode::Esc => {
                 self.rename_input = None;
                 self.pending_rename = None;
+                self.pending_overwrite = None;
                 self.status_message = "Renombrado cancelado".to_string();
             }
             KeyCode::Enter => {
@@ -409,11 +476,7 @@ impl App {
                 let Some(plan) = self.build_rename_plan(dialog) else {
                     return Ok(());
                 };
-                let message = format!(
-                    "Renombrar/mover {} a {}?",
-                    plan.source.display(),
-                    plan.destination.display()
-                );
+                let message = self.pending_rename_message(&plan);
                 self.pending_rename = Some(plan);
                 self.confirmation = Some(ConfirmationDialog {
                     action: PendingAction::Rename,
@@ -438,6 +501,52 @@ impl App {
         Ok(())
     }
 
+    fn handle_mkdir_input_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mkdir_input = None;
+                self.pending_mkdir = None;
+                self.status_message = "Creacion de directorio cancelada".to_string();
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.mkdir_input.take() else {
+                    return Ok(());
+                };
+                let raw_input = dialog.input.trim();
+                if raw_input.is_empty() {
+                    self.mkdir_input = Some(dialog);
+                    self.status_message = "El nombre del directorio no puede estar vacio".to_string();
+                    return Ok(());
+                }
+
+                let mut target = PathBuf::from(raw_input);
+                if !target.is_absolute() {
+                    target = dialog.base_dir.join(target);
+                }
+
+                self.pending_mkdir = Some(target.clone());
+                self.confirmation = Some(ConfirmationDialog {
+                    action: PendingAction::Mkdir,
+                    message: format!("Crear directorio {}?", target.display()),
+                });
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.mkdir_input {
+                    dialog.input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if !c.is_control() {
+                    if let Some(dialog) = &mut self.mkdir_input {
+                        dialog.input.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_confirmation_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -447,9 +556,21 @@ impl App {
                 if self
                     .confirmation
                     .as_ref()
-                    .is_some_and(|dialog| matches!(dialog.action, PendingAction::Rename))
+                    .is_some_and(|dialog| matches!(dialog.action, PendingAction::OverwriteConflict))
+                {
+                    self.confirmation = None;
+                    self.handle_overwrite_decision(false)?;
+                    return Ok(());
+                }
+
+                if self
+                    .confirmation
+                    .as_ref()
+                    .is_some_and(|dialog| matches!(dialog.action, PendingAction::Rename | PendingAction::Copy))
                 {
                     self.pending_rename = None;
+                    self.pending_mkdir = None;
+                    self.pending_overwrite = None;
                 }
                 self.confirmation = None;
                 self.status_message = "Operacion cancelada".to_string();
@@ -474,7 +595,30 @@ impl App {
                 self.inactive_panel_cwd().display()
             ),
             PendingAction::Rename => format!("Renombrar o mover {}?", list),
-            PendingAction::Delete => format!("Borrar {}?", list),
+            PendingAction::Mkdir => "Crear directorio?".to_string(),
+            PendingAction::OverwriteConflict => {
+                "Sobrescribir elemento existente?".to_string()
+            }
+            PendingAction::Delete => {
+                let names = self.active_panel().operation_targets();
+                let total = self.active_panel().operation_source_paths().len();
+                let directories = self.active_panel().operation_directory_count();
+                if total == 1 {
+                    let name = names
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "elemento".to_string());
+                    format!(
+                        "Borrar '{}' (directorios incluidos: {})?",
+                        name, directories
+                    )
+                } else {
+                    format!(
+                        "Borrar {} elemento(s), incluyendo {} directorio(s)?",
+                        total, directories
+                    )
+                }
+            }
             PendingAction::Quit => "Salir de la aplicacion?".to_string(),
         };
 
@@ -488,6 +632,7 @@ impl App {
 
         match dialog.action {
             PendingAction::Quit => {
+                self.exit_dir = Some(self.compute_exit_directory());
                 self.should_quit = true;
             }
             PendingAction::Copy => {
@@ -496,12 +641,50 @@ impl App {
             PendingAction::Rename => {
                 self.confirm_rename_move()?;
             }
+            PendingAction::Mkdir => {
+                self.confirm_mkdir()?;
+            }
+            PendingAction::OverwriteConflict => {
+                self.handle_overwrite_decision(true)?;
+            }
             PendingAction::Delete => {
-                self.status_message = format!("Borrado confirmado: {}", dialog.message);
+                self.confirm_delete();
             }
         }
 
         Ok(())
+    }
+
+    fn confirm_delete(&mut self) {
+        let sources = self.active_panel().operation_source_paths();
+        if sources.is_empty() {
+            self.status_message = "No hay elementos validos para borrar".to_string();
+            return;
+        }
+
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
+
+        for source in &sources {
+            match remove_path_recursive(source) {
+                Ok(()) => deleted += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        self.active_panel_mut().clear_marks();
+        if let Err(error) = self.reload_panels() {
+            self.status_message = format!(
+                "Borrados {} y fallidos {}. Error al recargar paneles: {error}",
+                deleted, failed
+            );
+            return;
+        }
+
+        self.status_message = format!(
+            "Borrados {} y fallidos {} elemento(s)",
+            deleted, failed
+        );
     }
 
     fn confirm_copy(&mut self) -> Result<()> {
@@ -511,30 +694,42 @@ impl App {
             return Ok(());
         }
 
-        let destination_dir = self.inactive_panel_cwd().to_path_buf();
-        let mut copied = 0usize;
+        self.pending_overwrite = Some(OverwriteBatchState {
+            remaining_sources: sources,
+            destination_dir: self.inactive_panel_cwd().to_path_buf(),
+            processed: 0,
+            skipped: 0,
+            current_conflict_source: None,
+            operation: OverwriteOperation::Copy,
+        });
+        self.advance_overwrite_batch()?;
+        Ok(())
+    }
 
-        for source in &sources {
-            let Some(name) = source.file_name() else {
-                continue;
-            };
-            let destination = destination_dir.join(name);
+    fn open_mkdir_input(&mut self) {
+        self.mkdir_input = Some(MkdirInputDialog {
+            base_dir: self.active_panel().cwd.clone(),
+            input: String::new(),
+        });
+        self.status_message = "F7: Ingrese nombre/ruta del directorio".to_string();
+    }
 
-            if destination.exists() {
-                self.status_message = format!(
-                    "No se copio {}: ya existe en destino",
-                    destination.display()
-                );
-                return Ok(());
-            }
+    fn confirm_mkdir(&mut self) -> Result<()> {
+        let Some(target) = self.pending_mkdir.take() else {
+            self.status_message = "No hay creacion de directorio pendiente".to_string();
+            return Ok(());
+        };
 
-            copy_path_recursive(source, &destination)?;
-            copied += 1;
+        if target.exists() {
+            self.status_message = format!("No se puede crear: {} ya existe", target.display());
+            return Ok(());
         }
 
-        self.active_panel_mut().clear_marks();
+        fs::create_dir_all(&target)
+            .with_context(|| format!("No se pudo crear directorio {}", target.display()))?;
+
         self.reload_panels()?;
-        self.status_message = format!("Copiados {} elemento(s) a {}", copied, destination_dir.display());
+        self.status_message = format!("Directorio creado: {}", target.display());
         Ok(())
     }
 
@@ -544,18 +739,16 @@ impl App {
             self.status_message = "No hay elemento valido para renombrar".to_string();
             return;
         }
-
-        if sources.len() > 1 {
-            self.status_message =
-                "F6 actualmente permite un solo elemento; desmarque multiples".to_string();
-            return;
-        }
-
-        let source = sources[0].clone();
         let default_move_dir = self.inactive_panel_cwd().to_path_buf();
+        let source_label = if sources.len() == 1 {
+            sources[0].display().to_string()
+        } else {
+            format!("{} elementos seleccionados", sources.len())
+        };
 
         self.rename_input = Some(RenameInputDialog {
-            source,
+            sources,
+            source_label,
             default_move_dir,
             input: String::new(),
         });
@@ -563,16 +756,38 @@ impl App {
             "F6: Enter mueve al otro panel; escriba para cambiar nombre".to_string();
     }
 
-    fn build_rename_plan(&mut self, dialog: RenameInputDialog) -> Option<RenamePlan> {
+    fn build_rename_plan(&mut self, dialog: RenameInputDialog) -> Option<PendingRenamePlan> {
         let raw_input = dialog.input.trim();
-        let destination = if raw_input.is_empty() {
-            let Some(name) = dialog.source.file_name() else {
-                self.rename_input = Some(dialog);
-                self.status_message = "Origen invalido".to_string();
-                return None;
-            };
-            dialog.default_move_dir.join(name)
-        } else {
+        if raw_input.is_empty() {
+            if dialog.sources.len() == 1 {
+                let source = dialog.sources[0].clone();
+                let Some(name) = source.file_name() else {
+                    self.rename_input = Some(dialog);
+                    self.status_message = "Origen invalido".to_string();
+                    return None;
+                };
+                let name = name.to_owned();
+                return Some(PendingRenamePlan::Single(RenamePlan {
+                    source,
+                    destination: dialog.default_move_dir.join(name),
+                }));
+            }
+
+            return Some(PendingRenamePlan::Multiple {
+                sources: dialog.sources,
+                destination_dir: dialog.default_move_dir,
+            });
+        }
+
+        if dialog.sources.len() > 1 {
+            self.rename_input = Some(dialog);
+            self.status_message =
+                "Con multiples, deje vacio y Enter para mover al panel opuesto".to_string();
+            return None;
+        }
+
+        let source = dialog.sources[0].clone();
+        let destination = {
             if raw_input.contains('/') || raw_input.contains('\\') {
                 self.rename_input = Some(dialog);
                 self.status_message =
@@ -580,7 +795,7 @@ impl App {
                 return None;
             }
 
-            let Some(parent) = dialog.source.parent() else {
+            let Some(parent) = source.parent() else {
                 self.rename_input = Some(dialog);
                 self.status_message = "Origen invalido".to_string();
                 return None;
@@ -588,10 +803,10 @@ impl App {
             parent.join(raw_input)
         };
 
-        Some(RenamePlan {
-            source: dialog.source,
+        Some(PendingRenamePlan::Single(RenamePlan {
+            source,
             destination,
-        })
+        }))
     }
 
     fn confirm_rename_move(&mut self) -> Result<()> {
@@ -600,43 +815,171 @@ impl App {
             return Ok(());
         };
 
-        if plan.destination.exists() {
-            self.status_message = format!(
-                "No se puede mover: el destino {} ya existe",
-                plan.destination.display()
-            );
-            return Ok(());
+        match plan {
+            PendingRenamePlan::Single(plan) => {
+                if plan.destination.exists() {
+                    self.status_message = format!(
+                        "No se puede mover: el destino {} ya existe",
+                        plan.destination.display()
+                    );
+                    return Ok(());
+                }
+
+                let Some(parent) = plan.destination.parent() else {
+                    self.status_message = "Destino invalido".to_string();
+                    return Ok(());
+                };
+
+                if !parent.exists() {
+                    self.status_message = format!(
+                        "No se puede mover: el directorio {} no existe",
+                        parent.display()
+                    );
+                    return Ok(());
+                }
+
+                fs::rename(&plan.source, &plan.destination).with_context(|| {
+                    format!(
+                        "No se pudo mover {} a {}",
+                        plan.source.display(),
+                        plan.destination.display()
+                    )
+                })?;
+
+                self.active_panel_mut().clear_marks();
+                self.reload_panels()?;
+                self.status_message = format!(
+                    "Movido/renombrado: {} -> {}",
+                    plan.source.display(),
+                    plan.destination.display()
+                );
+            }
+            PendingRenamePlan::Multiple {
+                sources,
+                destination_dir,
+            } => {
+                if !destination_dir.exists() || !destination_dir.is_dir() {
+                    self.status_message = format!(
+                        "No se puede mover: {} no es un directorio valido",
+                        destination_dir.display()
+                    );
+                    return Ok(());
+                }
+
+                self.pending_overwrite = Some(OverwriteBatchState {
+                    remaining_sources: sources,
+                    destination_dir,
+                    processed: 0,
+                    skipped: 0,
+                    current_conflict_source: None,
+                    operation: OverwriteOperation::Move,
+                });
+                self.advance_overwrite_batch()?;
+            }
         }
 
-        let Some(parent) = plan.destination.parent() else {
-            self.status_message = "Destino invalido".to_string();
+        Ok(())
+    }
+
+    fn pending_rename_message(&self, plan: &PendingRenamePlan) -> String {
+        match plan {
+            PendingRenamePlan::Single(plan) => format!(
+                "Renombrar/mover {} a {}?",
+                plan.source.display(),
+                plan.destination.display()
+            ),
+            PendingRenamePlan::Multiple {
+                sources,
+                destination_dir,
+            } => format!(
+                "Mover {} elemento(s) a {}?",
+                sources.len(),
+                destination_dir.display()
+            ),
+        }
+    }
+
+    fn handle_overwrite_decision(&mut self, overwrite: bool) -> Result<()> {
+        let Some(state) = &mut self.pending_overwrite else {
+            self.status_message = "No hay sobreescritura pendiente".to_string();
             return Ok(());
         };
 
-        if !parent.exists() {
-            self.status_message = format!(
-                "No se puede mover: el directorio {} no existe",
-                parent.display()
-            );
+        let Some(source) = state.current_conflict_source.take() else {
+            self.status_message = "No hay conflicto pendiente".to_string();
             return Ok(());
+        };
+
+        let Some(name) = source.file_name() else {
+            state.skipped += 1;
+            self.advance_overwrite_batch()?;
+            return Ok(());
+        };
+
+        let destination = state.destination_dir.join(name);
+        if overwrite {
+            remove_path_recursive(&destination)?;
+            apply_batch_operation(state.operation.clone(), &source, &destination)?;
+            state.processed += 1;
+        } else {
+            state.skipped += 1;
         }
 
-        fs::rename(&plan.source, &plan.destination).with_context(|| {
-            format!(
-                "No se pudo mover {} a {}",
-                plan.source.display(),
-                plan.destination.display()
-            )
-        })?;
-
-        self.active_panel_mut().clear_marks();
-        self.reload_panels()?;
-        self.status_message = format!(
-            "Movido/renombrado: {} -> {}",
-            plan.source.display(),
-            plan.destination.display()
-        );
+        self.advance_overwrite_batch()?;
         Ok(())
+    }
+
+    fn advance_overwrite_batch(&mut self) -> Result<()> {
+        loop {
+            let Some(state) = &mut self.pending_overwrite else {
+                return Ok(());
+            };
+
+            if state.remaining_sources.is_empty() {
+                let processed = state.processed;
+                let skipped = state.skipped;
+                let destination_dir = state.destination_dir.clone();
+                let operation = state.operation.clone();
+                self.pending_overwrite = None;
+
+                self.active_panel_mut().clear_marks();
+                self.reload_panels()?;
+                let verb = match operation {
+                    OverwriteOperation::Copy => "Copiados",
+                    OverwriteOperation::Move => "Movidos",
+                };
+                self.status_message =
+                    format!("{} {} y omitidos {} elemento(s) en {}", verb, processed, skipped, destination_dir.display());
+                return Ok(());
+            }
+
+            let source = state.remaining_sources.remove(0);
+            let Some(name) = source.file_name() else {
+                state.skipped += 1;
+                continue;
+            };
+
+            let destination = state.destination_for(&source).unwrap_or_else(|| state.destination_dir.join(name));
+            if destination.exists() {
+                state.current_conflict_source = Some(source);
+                let prompt = match state.operation {
+                    OverwriteOperation::Copy => "Sobrescribir copia",
+                    OverwriteOperation::Move => "Sobrescribir movimiento",
+                };
+                self.confirmation = Some(ConfirmationDialog {
+                    action: PendingAction::OverwriteConflict,
+                    message: format!(
+                        "El destino {} ya existe. {}?",
+                        destination.display(),
+                        prompt
+                    ),
+                });
+                return Ok(());
+            }
+
+            apply_batch_operation(state.operation.clone(), &source, &destination)?;
+            state.processed += 1;
+        }
     }
 
     fn reload_panels(&mut self) -> Result<()> {
@@ -655,6 +998,15 @@ impl App {
     fn panel_step(&self) -> usize {
         self.panel_page_size.max(1)
     }
+
+    fn compute_exit_directory(&self) -> PathBuf {
+        if let Some(entry) = self.active_panel().selected_entry() {
+            if entry.is_dir {
+                return entry.path.clone();
+            }
+        }
+        self.active_panel().cwd.clone()
+    }
 }
 
 fn read_dir_entries(path: &Path) -> Result<Vec<FileEntry>> {
@@ -665,7 +1017,11 @@ fn read_dir_entries(path: &Path) -> Result<Vec<FileEntry>> {
         .with_context(|| format!("No se pudo leer el directorio {}", path.display()))?
         .collect::<io::Result<Vec<_>>>()?;
 
-    raw_entries.sort_by_key(|entry| entry.file_name());
+    raw_entries.sort_by_key(|entry| {
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        (if is_dir { 0u8 } else { 1u8 }, name)
+    });
 
     for entry in raw_entries {
         let path = entry.path();
@@ -684,36 +1040,14 @@ fn read_dir_entries(path: &Path) -> Result<Vec<FileEntry>> {
             path,
             is_dir: metadata.is_dir(),
             is_executable,
+            size_bytes: if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            },
+            modified: metadata.modified().ok(),
         });
     }
 
     Ok(entries)
-}
-
-fn copy_path_recursive(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("No se pudo leer metadata de {}", source.display()))?;
-
-    if metadata.is_dir() {
-        fs::create_dir(destination)
-            .with_context(|| format!("No se pudo crear {}", destination.display()))?;
-        for entry in fs::read_dir(source)
-            .with_context(|| format!("No se pudo listar {}", source.display()))?
-        {
-            let entry = entry?;
-            let child_source = entry.path();
-            let child_destination = destination.join(entry.file_name());
-            copy_path_recursive(&child_source, &child_destination)?;
-        }
-        return Ok(());
-    }
-
-    fs::copy(source, destination).with_context(|| {
-        format!(
-            "No se pudo copiar {} a {}",
-            source.display(),
-            destination.display()
-        )
-    })?;
-    Ok(())
 }
