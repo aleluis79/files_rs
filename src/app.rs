@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use glob::Pattern;
 
 use crate::{
     ops::{OverwriteBatchState, OverwriteOperation, apply_batch_operation, remove_path_recursive},
@@ -16,6 +17,7 @@ use crate::{
 pub enum AppMode {
     Panels,
     Viewer(ViewerState),
+    Search(SearchState),
 }
 
 #[derive(Clone, Debug)]
@@ -30,6 +32,36 @@ pub struct RenameInputDialog {
 pub struct MkdirInputDialog {
     pub base_dir: PathBuf,
     pub input: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchInputDialog {
+    pub root_dir: PathBuf,
+    pub input: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchState {
+    pub root_dir: PathBuf,
+    pub query: String,
+    pub pattern: String,
+    pub file_type: Option<String>,
+    pub entries: Vec<FileEntry>,
+    pub selected: usize,
+    pub pending_dirs: Vec<PathBuf>,
+    pub processed_dirs: usize,
+    pub finished: bool,
+}
+
+impl SearchState {
+    pub fn progress_fraction(&self) -> f64 {
+        let remaining = self.pending_dirs.len();
+        let total = self.processed_dirs + remaining;
+        if total == 0 {
+            return if self.finished { 1.0 } else { 0.0 };
+        }
+        self.processed_dirs as f64 / total as f64
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +132,34 @@ impl FileEntry {
             is_executable: false,
             size_bytes: None,
             modified: None,
+        })
+    }
+
+    fn from_path(path: PathBuf) -> Result<Self> {
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("No se pudo leer metadata de {}", path.display()))?;
+        #[cfg(unix)]
+        let is_executable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let is_executable = false;
+
+        Ok(Self {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            path,
+            is_dir: metadata.is_dir(),
+            is_executable,
+            size_bytes: if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            },
+            modified: metadata.modified().ok(),
         })
     }
 }
@@ -220,6 +280,7 @@ pub struct App {
     pub show_help: bool,
     pub rename_input: Option<RenameInputDialog>,
     pub mkdir_input: Option<MkdirInputDialog>,
+    pub search_input: Option<SearchInputDialog>,
     pub pending_rename: Option<PendingRenamePlan>,
     pub pending_mkdir: Option<PathBuf>,
     pub pending_overwrite: Option<OverwriteBatchState>,
@@ -242,6 +303,7 @@ impl App {
             show_help: false,
             rename_input: None,
             mkdir_input: None,
+            search_input: None,
             pending_rename: None,
             pending_mkdir: None,
             pending_overwrite: None,
@@ -269,11 +331,20 @@ impl App {
             return self.handle_confirmation_key(key);
         }
 
+        if self.search_input.is_some() {
+            return self.handle_search_input_key(key);
+        }
+
         if matches!(self.mode, AppMode::Viewer(_)) {
             return self.handle_viewer_key(key);
         }
 
+        if matches!(self.mode, AppMode::Search(_)) {
+            return self.handle_search_key(key);
+        }
+
         match key.code {
+            KeyCode::F(2) => self.open_search_input(),
             KeyCode::F(1) => {
                 self.show_help = true;
             }
@@ -384,6 +455,260 @@ impl App {
             panel.reload()?;
         }
         Ok(())
+    }
+
+    fn open_search_input(&mut self) {
+        self.search_input = Some(SearchInputDialog {
+            root_dir: self.active_panel().cwd.clone(),
+            input: String::new(),
+        });
+        self.status_message = "F2: ingrese texto o patron (ej. *.rs type:md)".to_string();
+    }
+
+    fn search_state_mut(&mut self) -> Option<&mut SearchState> {
+        if let AppMode::Search(state) = &mut self.mode {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    pub fn advance_search(&mut self) -> Result<()> {
+        if let Some(state) = self.search_state_mut() {
+            if state.finished {
+                return Ok(());
+            }
+
+            let mut work = 0;
+            while work < 4 {
+                if let Some(dir) = state.pending_dirs.pop() {
+                    let read_dir = fs::read_dir(&dir);
+                    let entries = match read_dir {
+                        Ok(entries) => entries,
+                        Err(_) => {
+                            state.processed_dirs += 1;
+                            work += 1;
+                            continue;
+                        }
+                    };
+
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let metadata = match fs::symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
+
+                        let file_type = metadata.file_type();
+                        let is_dir = file_type.is_dir();
+                        let is_symlink = file_type.is_symlink();
+                        let is_executable = {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                metadata.permissions().mode() & 0o111 != 0
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                false
+                            }
+                        };
+
+                        if let Some(name_os) = path.file_name() {
+                            let name = name_os.to_string_lossy().to_string();
+                            if matches_search(
+                                &name,
+                                &path,
+                                is_dir,
+                                is_executable,
+                                &state.pattern,
+                                &state.file_type,
+                            ) {
+                                if let Ok(found) = FileEntry::from_path(path.clone()) {
+                                    state.entries.push(found);
+                                }
+                            }
+                        }
+
+                        if is_dir && !is_symlink {
+                            state.pending_dirs.push(path);
+                        }
+                    }
+
+                    state.processed_dirs += 1;
+                    work += 1;
+
+                    if state.entries.len() >= 500 {
+                        break;
+                    }
+                } else {
+                    state.finished = true;
+                    break;
+                }
+            }
+
+            if state.pending_dirs.is_empty() {
+                state.finished = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_search_input_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.search_input = None;
+                self.status_message = "Busqueda cancelada".to_string();
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.search_input.take() else {
+                    return Ok(());
+                };
+                let raw_input = dialog.input.trim();
+                if raw_input.is_empty() {
+                    self.search_input = Some(dialog);
+                    self.status_message = "Ingrese un texto para buscar".to_string();
+                    return Ok(());
+                }
+                let query = raw_input.to_string();
+                let (pattern, file_type) = parse_search_query(&query);
+                self.mode = AppMode::Search(SearchState {
+                    root_dir: dialog.root_dir.clone(),
+                    query,
+                    pattern,
+                    file_type,
+                    entries: Vec::new(),
+                    selected: 0,
+                    pending_dirs: vec![dialog.root_dir],
+                    processed_dirs: 0,
+                    finished: false,
+                });
+                self.status_message = "Busqueda iniciada".to_string();
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.search_input {
+                    dialog.input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if !c.is_control() {
+                    if let Some(dialog) = &mut self.search_input {
+                        dialog.input.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::F(1) => {
+                self.show_help = true;
+            }
+            KeyCode::Esc | KeyCode::Backspace => {
+                self.mode = AppMode::Panels;
+                self.status_message = "Busqueda cerrada".to_string();
+            }
+            KeyCode::Up => self.move_search_selection(-1),
+            KeyCode::Down => self.move_search_selection(1),
+            KeyCode::PageUp => self.move_search_selection(-(self.panel_step() as isize)),
+            KeyCode::PageDown => self.move_search_selection(self.panel_step() as isize),
+            KeyCode::Enter => self.open_search_selected()?,
+            KeyCode::F(3) => self.open_search_selected_preview(),
+            KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn move_search_selection(&mut self, delta: isize) {
+        if let Some(state) = self.search_state_mut() {
+            if state.entries.is_empty() {
+                state.selected = 0;
+                return;
+            }
+            let next = state.selected as isize + delta;
+            let upper = state.entries.len().saturating_sub(1) as isize;
+            state.selected = next.clamp(0, upper) as usize;
+        }
+    }
+
+    fn open_search_selected(&mut self) -> Result<()> {
+        let state = match std::mem::replace(&mut self.mode, AppMode::Panels) {
+            AppMode::Search(state) => state,
+            other => {
+                self.mode = other;
+                return Ok(());
+            }
+        };
+
+        let Some(entry) = state.entries.get(state.selected).cloned() else {
+            self.mode = AppMode::Search(state);
+            self.status_message = "No hay resultado seleccionado".to_string();
+            return Ok(());
+        };
+
+        let panel = self.active_panel_mut();
+        if entry.is_dir {
+            panel.cwd = entry.path;
+            panel.selected = 0;
+            panel.reload()?;
+            self.status_message = format!("Directorio abierto: {}", panel.cwd.display());
+            return Ok(());
+        }
+
+        let parent = entry
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| state.root_dir.clone());
+        panel.cwd = parent;
+        panel.selected = 0;
+        panel.reload()?;
+
+        if let Some(index) = panel.entries.iter().position(|item| item.path == entry.path) {
+            panel.selected = index;
+        }
+
+        self.status_message = format!(
+            "Directorio abierto: {} (archivo seleccionado: {})",
+            panel.cwd.display(),
+            entry.name
+        );
+        Ok(())
+    }
+
+    fn open_search_selected_preview(&mut self) {
+        let state = match std::mem::replace(&mut self.mode, AppMode::Panels) {
+            AppMode::Search(state) => state,
+            other => {
+                self.mode = other;
+                return;
+            }
+        };
+
+        let selected_entry = state.entries.get(state.selected).cloned();
+        if let Some(entry) = selected_entry {
+            if entry.is_dir {
+                self.mode = AppMode::Search(state);
+                self.status_message = format!("{} es un directorio; F3 solo abre archivos de texto", entry.name);
+                return;
+            }
+            match ViewerState::open(&entry.path) {
+                Ok(viewer) => {
+                    self.mode = AppMode::Viewer(viewer);
+                    self.status_message = format!("Visualizando: {}", entry.name);
+                }
+                Err(error) => {
+                    self.mode = AppMode::Search(state);
+                    self.status_message = format!("No se puede visualizar {}: {error}", entry.name);
+                }
+            }
+        } else {
+            self.mode = AppMode::Search(state);
+        }
     }
 
     fn preview_selected(&mut self) {
@@ -1050,4 +1375,66 @@ fn read_dir_entries(path: &Path) -> Result<Vec<FileEntry>> {
     }
 
     Ok(entries)
+}
+
+fn parse_search_query(raw: &str) -> (String, Option<String>) {
+    let mut file_type = None;
+    let mut pattern_parts = Vec::new();
+
+    for token in raw.split_whitespace() {
+        if let Some(ext) = token.strip_prefix("type:") {
+            let ext = ext.trim_start_matches('.').to_lowercase();
+            if !ext.is_empty() {
+                file_type = Some(ext);
+            }
+        } else {
+            pattern_parts.push(token);
+        }
+    }
+
+    let pattern = if pattern_parts.is_empty() {
+        "*".to_string()
+    } else {
+        pattern_parts.join(" ")
+    };
+    (pattern, file_type)
+}
+
+fn normalize_extension(ext: &str) -> String {
+    ext.trim_start_matches('.').to_lowercase()
+}
+
+fn matches_search(name: &str, path: &Path, is_dir: bool, is_executable: bool, pattern: &str, file_type: &Option<String>) -> bool {
+    let name = name.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    let file_type_matches = match file_type.as_deref() {
+        None => true,
+        Some("dir") => is_dir,
+        Some("exe") => !is_dir && is_executable,
+        Some(ext) => {
+            if is_dir {
+                false
+            } else {
+                path.extension()
+                    .map(|current| normalize_extension(&current.to_string_lossy()))
+                    .as_deref()
+                    == Some(ext)
+            }
+        }
+    };
+
+    if !file_type_matches {
+        return false;
+    }
+
+    let uses_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+
+    if uses_glob {
+        match Pattern::new(&pattern) {
+            Ok(pattern) => pattern.matches(&name),
+            Err(_) => name.contains(&pattern),
+        }
+    } else {
+        name.contains(&pattern)
+    }
 }

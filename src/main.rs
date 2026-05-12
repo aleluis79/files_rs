@@ -52,6 +52,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<std:
         let panel_visible_rows = area.height.saturating_sub(8) as usize;
         app.set_panel_page_size(panel_visible_rows);
         app.advance_marquee();
+        app.advance_search()?;
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 

@@ -1,20 +1,48 @@
 use chrono::{DateTime, Local};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use users::get_current_username;
 
 use crate::{
-    app::{ActivePanel, App, AppMode, PanelState},
+    app::{ActivePanel, App, AppMode, PanelState, SearchState},
     viewer::ViewerState,
 };
+
+fn text_with_blinking_cursor<'a>(input: &'a str, tick: u64) -> Line<'a> {
+    let cursor_char = "▌";
+    let cursor_style = if tick % 2 == 0 {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    Line::from(vec![
+        Span::raw(input),
+        Span::styled(cursor_char, cursor_style),
+    ])
+}
 
 pub fn render(frame: &mut Frame, app: &App) {
     if let AppMode::Viewer(viewer) = &app.mode {
         render_viewer(frame, viewer, &app.status_message);
         render_mkdir_input(frame, app);
         render_rename_input(frame, app);
+        render_search_input(frame, app);
+        render_confirmation(frame, app);
+        render_help(frame, app);
+        return;
+    }
+
+    if let AppMode::Search(state) = &app.mode {
+        render_search(frame, state, &app.status_message);
+        render_mkdir_input(frame, app);
+        render_rename_input(frame, app);
+        render_search_input(frame, app);
         render_confirmation(frame, app);
         render_help(frame, app);
         return;
@@ -67,7 +95,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -81,6 +109,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_mkdir_input(frame, app);
     render_rename_input(frame, app);
+    render_search_input(frame, app);
     render_confirmation(frame, app);
     render_help(frame, app);
 }
@@ -91,11 +120,14 @@ fn render_mkdir_input(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(frame.area(), 68, 28);
-    let content = format!(
-        "Base: {}\n\nNombre o ruta de directorio:\n{}\n\nEnter confirmar, Esc cancelar, Backspace borrar",
-        dialog.base_dir.display(),
-        dialog.input
-    );
+    let content = Text::from(vec![
+        Line::from(Span::raw(format!("Base: {}", dialog.base_dir.display()))),
+        Line::from(""),
+        Line::from("Nombre o ruta de directorio:"),
+        text_with_blinking_cursor(&dialog.input, app.marquee_tick),
+        Line::from(""),
+        Line::from("Enter confirmar, Esc cancelar, Backspace borrar"),
+    ]);
 
     let overlay = Paragraph::new(content)
         .style(Style::default().fg(Color::White))
@@ -343,12 +375,16 @@ fn render_rename_input(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(frame.area(), 72, 30);
-    let content = format!(
-        "Origen: {}\n\nDestino por defecto (Enter): {}\n\nSi hay un solo elemento, escriba para cambiar nombre en el directorio actual:\n{}\n\nEnter confirmar, Esc cancelar, Backspace borrar",
-        dialog.source_label,
-        dialog.default_move_dir.display(),
-        dialog.input
-    );
+    let content = Text::from(vec![
+        Line::from(Span::raw(format!("Origen: {}", dialog.source_label))),
+        Line::from(""),
+        Line::from(Span::raw(format!("Destino por defecto (Enter): {}", dialog.default_move_dir.display()))),
+        Line::from(""),
+        Line::from("Si hay un solo elemento, escriba para cambiar nombre en el directorio actual:"),
+        text_with_blinking_cursor(&dialog.input, app.marquee_tick),
+        Line::from(""),
+        Line::from("Enter confirmar, Esc cancelar, Backspace borrar"),
+    ]);
 
     let overlay = Paragraph::new(content)
         .style(Style::default().fg(Color::White))
@@ -361,6 +397,123 @@ fn render_rename_input(frame: &mut Frame, app: &App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(overlay, area);
+}
+
+fn render_search_input(frame: &mut Frame, app: &App) {
+    let Some(dialog) = &app.search_input else {
+        return;
+    };
+
+    let area = centered_rect(frame.area(), 68, 24);
+    let content = Text::from(vec![
+        Line::from(Span::raw(format!("Buscar en: {}", dialog.root_dir.display()))),
+        Line::from(""),
+        Line::from("Ingrese texto o patron (*.rs, foo*bar) y opcional type:<ext>:"),
+        text_with_blinking_cursor(&dialog.input, app.marquee_tick),
+        Line::from(""),
+        Line::from("Enter para buscar, Esc cancelar, Backspace borrar"),
+    ]);
+
+    let overlay = Paragraph::new(content)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightMagenta))
+                .title("F2 Buscar archivos"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(overlay, area);
+}
+
+fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let header = Paragraph::new(format!("Buscar: '{}' en {}", state.query, state.root_dir.display()))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(Block::default().borders(Borders::ALL).title("Busqueda"))
+        .centered();
+    frame.render_widget(header, layout[0]);
+
+    let progress = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if state.finished {
+                    "Busqueda completada"
+                } else {
+                    "Progreso de busqueda"
+                }),
+        )
+        .gauge_style(Style::default().fg(Color::Magenta).bg(Color::Black))
+        .ratio(state.progress_fraction());
+    frame.render_widget(progress, layout[1]);
+
+    let items = if state.entries.is_empty() {
+        vec![ListItem::new("No se encontraron resultados").style(Style::default().fg(Color::Gray))]
+    } else {
+        state
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let marker = if entry.is_dir {
+                    "[DIR]"
+                } else if entry.is_executable {
+                    "[EXE]"
+                } else {
+                    "     "
+                };
+                let style = if index == state.selected {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(format!("{} {} - {}", marker, entry.name, entry.path.display()))
+                    .style(style)
+            })
+            .collect()
+    };
+
+    let body = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Resultados ({})", state.entries.len())),
+    );
+    frame.render_widget(body, layout[2]);
+
+    let footer_text = if state.finished {
+        format!(
+            "{} | Enter ir al directorio / F3 ver contenido / Esc volver | {} resultados",
+            status_message,
+            state.entries.len()
+        )
+    } else {
+        format!(
+            "{} | Buscando {} directorio(s) pendientes | Esc detiene busqueda | {} resultados",
+            status_message,
+            state.pending_dirs.len(),
+            state.entries.len()
+        )
+    };
+
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::Cyan))
+        .block(Block::default().borders(Borders::ALL).title("Estado"));
+    frame.render_widget(footer, layout[3]);
 }
 
 fn render_help(frame: &mut Frame, app: &App) {
@@ -383,8 +536,11 @@ fn render_help(frame: &mut Frame, app: &App) {
         "Tab cambia panel activo",
         "PageUp/PageDown desplaza por paginas en paneles",
         "Espacio marca/desmarca seleccion",
-        "Enter abre directorio",
-        "Backspace sube al directorio padre",
+        "Enter abre directorio o selecciona archivo en su carpeta",
+        "F3 ver archivo de texto en resultados",
+        "Usa comodines: *.rs, foo*bar",
+        "Backspace sube al directorio padre o cierra busqueda",
+        "F2 Buscar archivos desde el directorio activo",
         "",
         "Esc o F1 para cerrar esta ayuda",
     ]
