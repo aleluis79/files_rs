@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use glob::Pattern;
 
 use crate::{
@@ -350,6 +350,7 @@ pub struct App {
     pub panel_page_size: usize,
     pub marquee_tick: u64,
     pub show_help: bool,
+    pub show_capibara: bool,
     pub rename_input: Option<RenameInputDialog>,
     pub mkdir_input: Option<MkdirInputDialog>,
     pub search_input: Option<SearchInputDialog>,
@@ -373,6 +374,7 @@ impl App {
             panel_page_size: 10,
             marquee_tick: 0,
             show_help: false,
+            show_capibara: false,
             rename_input: None,
             mkdir_input: None,
             search_input: None,
@@ -401,6 +403,19 @@ impl App {
 
         if self.confirmation.is_some() {
             return self.handle_confirmation_key(key);
+        }
+
+        if key.code == KeyCode::F(1) && key.modifiers.contains(KeyModifiers::SHIFT) {
+            self.show_capibara = !self.show_capibara;
+            return Ok(());
+        }
+
+        if self.show_capibara
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::F(1) && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            self.show_capibara = false;
+            return Ok(());
         }
 
         if self.search_input.is_some() {
@@ -439,6 +454,11 @@ impl App {
             KeyCode::F(6) => self.open_rename_input(),
             KeyCode::F(7) => self.open_mkdir_input(),
             KeyCode::F(8) => self.open_confirmation(PendingAction::Delete),
+            KeyCode::F(9) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let panel = self.active_panel_mut();
+                panel.toggle_sort_order()?;
+                self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
+            }
             KeyCode::F(9) => {
                 let panel = self.active_panel_mut();
                 panel.cycle_sort_mode()?;

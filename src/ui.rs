@@ -35,6 +35,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_search_input(frame, app);
         render_confirmation(frame, app);
         render_help(frame, app);
+        render_capibara(frame, app);
         return;
     }
 
@@ -45,6 +46,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_search_input(frame, app);
         render_confirmation(frame, app);
         render_help(frame, app);
+        render_capibara(frame, app);
         return;
     }
 
@@ -112,6 +114,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_search_input(frame, app);
     render_confirmation(frame, app);
     render_help(frame, app);
+    render_capibara(frame, app);
 }
 
 fn render_mkdir_input(frame: &mut Frame, app: &App) {
@@ -706,7 +709,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F7  Crear directorio (con entrada y confirmacion)",
         "F8  Borrar seleccion (con confirmacion)",
         "F9  Cambiar modo de orden",
-        "F12 Cambiar direccion del orden",
+        "Shift+F9 Cambiar direccion del orden",
         "F10 Salir (con confirmacion)",
         "",
         "Tab cambia panel activo",
@@ -734,6 +737,41 @@ fn render_help(frame: &mut Frame, app: &App) {
     frame.render_widget(overlay, area);
 }
 
+fn render_capibara(frame: &mut Frame, app: &App) {
+    if !app.show_capibara {
+        return;
+    }
+
+    let area = centered_rect(frame.area(), 55, 30);
+    let content = Text::from(vec![
+        Line::from(r#"      //__//"#),
+        Line::from(r#"     /  -  \"#),
+        Line::from(r#"    /       \"#),
+        Line::from(r#"   /  |Y     \"#),
+        Line::from(r#"  /   |      | \"#),
+        Line::from(r#" |    |______|  |"#),
+        Line::from(r#" |   /       /  /"#),
+        Line::from(r#"  \_/ \_____/  /"#),
+        Line::from(r#"       '-----'"#),
+        Line::from(r#""#),
+        Line::from(r#"  Capibara en pantalla!"#),
+        Line::from(r#""#),
+        Line::from(r#"Presiona Shift+F1 o Esc para cerrar"#),
+    ]);
+
+    let overlay = Paragraph::new(content)
+        .style(Style::default().fg(Color::LightYellow))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightMagenta))
+                .title("Easter Egg"),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(overlay, area);
+}
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
