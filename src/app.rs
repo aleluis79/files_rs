@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
@@ -96,6 +97,56 @@ pub struct ConfirmationDialog {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortMode {
+    Name,
+    Size,
+    Modified,
+    Type,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Modified,
+            SortMode::Modified => SortMode::Type,
+            SortMode::Type => SortMode::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "Nombre",
+            SortMode::Size => "Tamaño",
+            SortMode::Modified => "Fecha",
+            SortMode::Type => "Tipo",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+impl SortOrder {
+    pub fn toggle(self) -> Self {
+        match self {
+            SortOrder::Ascending => SortOrder::Descending,
+            SortOrder::Descending => SortOrder::Ascending,
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            SortOrder::Ascending => "↑",
+            SortOrder::Descending => "↓",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActivePanel {
     Left,
     Right,
@@ -170,6 +221,9 @@ pub struct PanelState {
     pub entries: Vec<FileEntry>,
     pub selected: usize,
     pub marked: BTreeSet<PathBuf>,
+    pub sort_mode: SortMode,
+    pub sort_order: SortOrder,
+    pub show_hidden: bool,
 }
 
 impl PanelState {
@@ -179,17 +233,35 @@ impl PanelState {
             entries: Vec::new(),
             selected: 0,
             marked: BTreeSet::new(),
+            sort_mode: SortMode::Name,
+            sort_order: SortOrder::Ascending,
+            show_hidden: false,
         };
         panel.reload()?;
         Ok(panel)
     }
 
     pub fn reload(&mut self) -> Result<()> {
-        self.entries = read_dir_entries(&self.cwd)?;
+        self.entries = read_dir_entries(&self.cwd, self.sort_mode, self.sort_order, self.show_hidden)?;
         if self.selected >= self.entries.len() {
             self.selected = self.entries.len().saturating_sub(1);
         }
         Ok(())
+    }
+
+    pub fn cycle_sort_mode(&mut self) -> Result<()> {
+        self.sort_mode = self.sort_mode.next();
+        self.reload()
+    }
+
+    pub fn toggle_sort_order(&mut self) -> Result<()> {
+        self.sort_order = self.sort_order.toggle();
+        self.reload()
+    }
+
+    pub fn toggle_show_hidden(&mut self) -> Result<()> {
+        self.show_hidden = !self.show_hidden;
+        self.reload()
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -348,7 +420,6 @@ impl App {
             KeyCode::F(1) => {
                 self.show_help = true;
             }
-            KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
             KeyCode::Tab => self.active_panel = self.active_panel.toggle(),
             KeyCode::Up => self.active_panel_mut().move_selection(-1),
             KeyCode::Down => self.active_panel_mut().move_selection(1),
@@ -368,6 +439,26 @@ impl App {
             KeyCode::F(6) => self.open_rename_input(),
             KeyCode::F(7) => self.open_mkdir_input(),
             KeyCode::F(8) => self.open_confirmation(PendingAction::Delete),
+            KeyCode::F(9) => {
+                let panel = self.active_panel_mut();
+                panel.cycle_sort_mode()?;
+                self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
+            }
+            KeyCode::F(4) => {
+                let panel = self.active_panel_mut();
+                panel.toggle_show_hidden()?;
+                self.status_message = if panel.show_hidden {
+                    "Ocultos visibles".to_string()
+                } else {
+                    "Ocultos ocultos".to_string()
+                };
+            }
+            KeyCode::F(12) => {
+                let panel = self.active_panel_mut();
+                panel.toggle_sort_order()?;
+                self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
+            }
+            KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
             _ => {}
         }
         Ok(())
@@ -516,6 +607,11 @@ impl App {
 
                         if let Some(name_os) = path.file_name() {
                             let name = name_os.to_string_lossy().to_string();
+
+                            if is_dir && is_ignored_search_dir(&name) {
+                                continue;
+                            }
+
                             if matches_search(
                                 &name,
                                 &path,
@@ -528,10 +624,10 @@ impl App {
                                     state.entries.push(found);
                                 }
                             }
-                        }
 
-                        if is_dir && !is_symlink {
-                            state.pending_dirs.push(path);
+                            if is_dir && !is_symlink {
+                                state.pending_dirs.push(path);
+                            }
                         }
                     }
 
@@ -1334,7 +1430,7 @@ impl App {
     }
 }
 
-fn read_dir_entries(path: &Path) -> Result<Vec<FileEntry>> {
+fn read_dir_entries(path: &Path, sort_mode: SortMode, sort_order: SortOrder, show_hidden: bool) -> Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     entries.push(FileEntry::parent_dir(path)?);
 
@@ -1342,10 +1438,48 @@ fn read_dir_entries(path: &Path) -> Result<Vec<FileEntry>> {
         .with_context(|| format!("No se pudo leer el directorio {}", path.display()))?
         .collect::<io::Result<Vec<_>>>()?;
 
-    raw_entries.sort_by_key(|entry| {
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        (if is_dir { 0u8 } else { 1u8 }, name)
+    raw_entries.retain(|entry| {
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+        show_hidden || !name.starts_with('.')
+    });
+
+    raw_entries.sort_by(|a, b| {
+        let a_is_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let b_is_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let dir_order = a_is_dir.cmp(&b_is_dir).reverse();
+        if dir_order != Ordering::Equal {
+            return dir_order;
+        }
+
+        let order = match sort_mode {
+            SortMode::Name => {
+                let a_name = a.file_name().to_string_lossy().to_lowercase();
+                let b_name = b.file_name().to_string_lossy().to_lowercase();
+                a_name.cmp(&b_name)
+            }
+            SortMode::Size => {
+                let a_size = a.metadata().map(|m| m.len()).unwrap_or(0);
+                let b_size = b.metadata().map(|m| m.len()).unwrap_or(0);
+                a_size.cmp(&b_size)
+            }
+            SortMode::Modified => {
+                let a_modified = a.metadata().and_then(|m| m.modified()).ok();
+                let b_modified = b.metadata().and_then(|m| m.modified()).ok();
+                a_modified.cmp(&b_modified)
+            }
+            SortMode::Type => {
+                let a_ext = a.path().extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                let b_ext = b.path().extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                a_ext.cmp(&b_ext)
+            }
+        };
+
+        if sort_order == SortOrder::Descending {
+            order.reverse()
+        } else {
+            order
+        }
     });
 
     for entry in raw_entries {
@@ -1398,6 +1532,10 @@ fn parse_search_query(raw: &str) -> (String, Option<String>) {
         pattern_parts.join(" ")
     };
     (pattern, file_type)
+}
+
+fn is_ignored_search_dir(name: &str) -> bool {
+    matches!(name, ".git" | "node_modules" | "bin" | "obj" | "target")
 }
 
 fn normalize_extension(ext: &str) -> String {

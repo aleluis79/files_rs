@@ -95,7 +95,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F4 Ocultos F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -213,11 +213,19 @@ fn render_panel(
         })
         .collect::<Vec<_>>();
 
+    let hidden_label = if panel.show_hidden { "H:ON" } else { "H:OFF" };
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(format!("{}: {}", title, panel.cwd.display())),
+            .title(format!(
+                "{}: {} [{} {} {}]",
+                title,
+                panel.cwd.display(),
+                panel.sort_mode.label(),
+                panel.sort_order.symbol(),
+                hidden_label
+            )),
     );
     frame.render_widget(list, area);
 }
@@ -299,6 +307,156 @@ fn format_modified(time: std::time::SystemTime) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
+fn syntax_highlight_line(line: &str, extension: &str) -> Vec<Span<'static>> {
+    if extension == "md" {
+        if line.trim_start().starts_with('#') {
+            return vec![Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )];
+        }
+    }
+
+    let comment_marker = match extension {
+        "rs" | "c" | "cpp" | "h" | "hpp" | "java" | "js" | "ts" | "jsx" | "tsx" | "go" | "dart" => "//",
+        "py" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" => "#",
+        "sql" => "--",
+        _ => "",
+    };
+
+    let mut spans = Vec::new();
+    let (code_part, comment_part) = if !comment_marker.is_empty() {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut idx = 0;
+        let mut comment_start = None;
+
+        while idx < line.len() {
+            let ch = line[idx..].chars().next().unwrap();
+            if ch == '"' && !in_single {
+                in_double = !in_double;
+            } else if ch == '\'' && !in_double {
+                in_single = !in_single;
+            }
+
+            if !in_single && !in_double && line[idx..].starts_with(comment_marker) {
+                comment_start = Some(idx);
+                break;
+            }
+
+            idx += ch.len_utf8();
+        }
+
+        if let Some(start) = comment_start {
+            (&line[..start], Some(&line[start..]))
+        } else {
+            (line, None)
+        }
+    } else {
+        (line, None)
+    };
+
+    let keywords: &[&str] = if extension == "rs" {
+        &["fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod", "match", "if", "else", "loop", "while", "for", "in", "return", "const", "static", "true", "false", "self", "super", "crate", "async", "await", "unsafe", "type", "where", "as"]
+    } else if extension == "py" {
+        &["def", "class", "import", "from", "as", "if", "elif", "else", "for", "while", "try", "except", "finally", "with", "return", "yield", "lambda", "pass", "break", "continue", "True", "False", "None", "and", "or", "not", "is", "in", "global", "nonlocal", "assert", "async", "await"]
+    } else if matches!(extension, "js" | "ts" | "jsx" | "tsx") {
+        &["function", "const", "let", "var", "if", "else", "for", "while", "switch", "case", "return", "async", "await", "import", "from", "export", "class", "extends", "new", "try", "catch", "finally", "true", "false", "null", "undefined", "this"]
+    } else if extension == "json" {
+        &["true", "false", "null"]
+    } else if matches!(extension, "toml" | "yaml" | "yml") {
+        &["true", "false", "null"]
+    } else {
+        &[]
+    };
+
+    let mut idx = 0;
+    let mut buffer = String::new();
+
+    fn flush_buffer(spans: &mut Vec<Span<'static>>, buffer: &mut String, style: Style) {
+        if !buffer.is_empty() {
+            spans.push(Span::styled(buffer.clone(), style));
+            buffer.clear();
+        }
+    }
+
+    while idx < code_part.len() {
+        let ch = code_part[idx..].chars().next().unwrap();
+
+        if ch == '"' || ch == '\'' || (ch == '`' && matches!(extension, "sh" | "bash" | "zsh" | "js" | "ts" | "jsx" | "tsx")) {
+            flush_buffer(&mut spans, &mut buffer, Style::default());
+            let quote = ch;
+            let mut string = String::new();
+            string.push(ch);
+            idx += ch.len_utf8();
+            let mut escaped = false;
+            while idx < code_part.len() {
+                let c = code_part[idx..].chars().next().unwrap();
+                string.push(c);
+                idx += c.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == quote {
+                    break;
+                }
+            }
+            spans.push(Span::styled(string, Style::default().fg(Color::Green)));
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            flush_buffer(&mut spans, &mut buffer, Style::default());
+            let mut number = String::new();
+            while idx < code_part.len() {
+                let c = code_part[idx..].chars().next().unwrap();
+                if c.is_ascii_digit() || c == '.' || c == 'x' || c == 'X' || c == 'b' || c == 'B' || c == '_' {
+                    number.push(c);
+                    idx += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            spans.push(Span::styled(number, Style::default().fg(Color::Yellow)));
+            continue;
+        }
+
+        if ch.is_alphanumeric() || ch == '_' {
+            let start = idx;
+            while idx < code_part.len() {
+                let c = code_part[idx..].chars().next().unwrap();
+                if c.is_alphanumeric() || c == '_' {
+                    idx += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let token = &code_part[start..idx];
+            if keywords.iter().any(|kw| *kw == token) {
+                flush_buffer(&mut spans, &mut buffer, Style::default());
+                spans.push(Span::styled(token.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            } else {
+                buffer.push_str(token);
+            }
+            continue;
+        }
+
+        buffer.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    flush_buffer(&mut spans, &mut buffer, Style::default());
+
+    if let Some(comment) = comment_part {
+        spans.push(Span::styled(comment.to_string(), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)));
+    }
+
+    spans
+}
+
 fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -326,17 +484,31 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) 
     let max_offset = viewer.lines.len().saturating_sub(height.max(1));
     let offset = viewer.scroll.min(max_offset);
 
+    let extension = viewer
+        .path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
     let content = viewer
         .lines
         .iter()
         .skip(offset)
         .take(height.max(1))
         .enumerate()
-        .map(|(index, line)| Line::from(format!("{:>4} {}", offset + index + 1, line)))
+        .map(|(index, line)| {
+            let mut spans = Vec::new();
+            spans.push(Span::styled(
+                format!("{:>4} ", offset + index + 1),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.extend(syntax_highlight_line(line, &extension));
+            Line::from(spans)
+        })
         .collect::<Vec<_>>();
 
-    let body =
-        Paragraph::new(content).block(Block::default().borders(Borders::ALL).title("Contenido"));
+    let body = Paragraph::new(content).block(Block::default().borders(Borders::ALL).title("Contenido"));
     frame.render_widget(body, layout[1]);
 
     let footer = Paragraph::new(format!(
@@ -526,11 +698,15 @@ fn render_help(frame: &mut Frame, app: &App) {
         "Ayuda de Teclas de Funcion",
         "",
         "F1  Ayuda",
+        "F2  Buscar archivos desde el directorio activo",
         "F3  Visualizar archivo de texto/markdown",
+        "F4  Alternar archivos ocultos",
         "F5  Copiar al panel opuesto (con confirmacion)",
         "F6  Enter mueve al panel opuesto; escribir cambia nombre",
         "F7  Crear directorio (con entrada y confirmacion)",
         "F8  Borrar seleccion (con confirmacion)",
+        "F9  Cambiar modo de orden",
+        "F12 Cambiar direccion del orden",
         "F10 Salir (con confirmacion)",
         "",
         "Tab cambia panel activo",
@@ -540,7 +716,6 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F3 ver archivo de texto en resultados",
         "Usa comodines: *.rs, foo*bar",
         "Backspace sube al directorio padre o cierra busqueda",
-        "F2 Buscar archivos desde el directorio activo",
         "",
         "Esc o F1 para cerrar esta ayuda",
     ]
