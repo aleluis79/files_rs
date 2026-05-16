@@ -742,21 +742,27 @@ fn render_capibara(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let area = centered_rect(frame.area(), 55, 30);
+    let area = centered_rect(frame.area(), 30, 50);
     let content = Text::from(vec![
-        Line::from(r#"      //__//"#),
-        Line::from(r#"     /  -  \"#),
-        Line::from(r#"    /       \"#),
-        Line::from(r#"   /  |Y     \"#),
-        Line::from(r#"  /   |      | \"#),
-        Line::from(r#" |    |______|  |"#),
-        Line::from(r#" |   /       /  /"#),
-        Line::from(r#"  \_/ \_____/  /"#),
-        Line::from(r#"       '-----'"#),
+        Line::from(r#"                    -:     :."#),
+        Line::from(r#"                .:-=++===-=--"#),
+        Line::from(r#"            .:-====++=--=++=-"#),
+        Line::from(r#"          .---===++++-:-+++++-"#),
+        Line::from(r#"          :=---++++++++++++==+:"#),
+        Line::from(r#"          :++++++++++++++++==++:"#),
+        Line::from(r#"           --==++++++++++==+++++=:"#),
+        Line::from(r#"            .:-=====+++++++++++++++-."#),
+        Line::from(r#"                 -===++++++++++++++++-"#),
+        Line::from(r#"                 =++++++++++++++++=+++="#),
+        Line::from(r#"                 :+++++++++++++=+++++++-"#),
+        Line::from(r#"                  :==+=+++++++=++++++++-"#),
+        Line::from(r#"                  .----+++=====++++++==."#),
+        Line::from(r#"                 .::: .---------=====-."#),
+        Line::from(r#"                     .:::  ..::....."#),
         Line::from(r#""#),
-        Line::from(r#"  Capibara en pantalla!"#),
+        Line::from(r#"                 Capibara en pantalla!"#),
         Line::from(r#""#),
-        Line::from(r#"Presiona Shift+F1 o Esc para cerrar"#),
+        Line::from(r#"          Presiona Shift+F1 o Esc para cerrar"#),
     ]);
 
     let overlay = Paragraph::new(content)
