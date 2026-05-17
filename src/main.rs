@@ -1,5 +1,8 @@
 mod app;
+mod config;
 mod ops;
+mod remote;
+mod transfer;
 mod ui;
 mod viewer;
 
@@ -53,6 +56,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<std:
         app.set_panel_page_size(panel_visible_rows);
         app.advance_marquee();
         app.advance_search()?;
+        app.advance_transfer()?;
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 

@@ -1,17 +1,26 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc::{Receiver, TryRecvError},
+    },
+    time::Instant,
     time::SystemTime,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use glob::Pattern;
 
 use crate::{
+    config::{ConfigStore, SavedConnection},
     ops::{OverwriteBatchState, OverwriteOperation, apply_batch_operation, remove_path_recursive},
+    remote::RemoteSession,
+    transfer::{CopyJob, TransferBackend, TransferEvent, spawn_copy_worker},
     viewer::ViewerState,
 };
 
@@ -39,6 +48,48 @@ pub struct MkdirInputDialog {
 pub struct SearchInputDialog {
     pub root_dir: PathBuf,
     pub input: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteConnectionField {
+    Host,
+    Port,
+    Username,
+    Password,
+    Save,
+}
+
+impl RemoteConnectionField {
+    fn next(self) -> Self {
+        match self {
+            Self::Host => Self::Port,
+            Self::Port => Self::Username,
+            Self::Username => Self::Password,
+            Self::Password => Self::Save,
+            Self::Save => Self::Host,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Host => Self::Save,
+            Self::Port => Self::Host,
+            Self::Username => Self::Port,
+            Self::Password => Self::Username,
+            Self::Save => Self::Password,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteConnectionDialog {
+    pub host: String,
+    pub port: String,
+    pub username: String,
+    pub password: String,
+    pub save_connection: bool,
+    pub selected_saved: Option<usize>,
+    pub selected_field: RemoteConnectionField,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +120,7 @@ impl SearchState {
 pub struct RenamePlan {
     pub source: PathBuf,
     pub destination: PathBuf,
+    pub destination_backend: PanelBackend,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +129,7 @@ pub enum PendingRenamePlan {
     Multiple {
         sources: Vec<PathBuf>,
         destination_dir: PathBuf,
+        destination_backend: PanelBackend,
     },
 }
 
@@ -87,6 +140,7 @@ pub enum PendingAction {
     Mkdir,
     OverwriteConflict,
     Delete,
+    DeleteSavedConnection,
     Quit,
 }
 
@@ -217,6 +271,7 @@ impl FileEntry {
 
 #[derive(Clone, Debug)]
 pub struct PanelState {
+    pub backend: PanelBackend,
     pub cwd: PathBuf,
     pub entries: Vec<FileEntry>,
     pub selected: usize,
@@ -226,9 +281,16 @@ pub struct PanelState {
     pub show_hidden: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PanelBackend {
+    Local,
+    Remote { connection_name: String },
+}
+
 impl PanelState {
     pub fn new(cwd: PathBuf) -> Result<Self> {
         let mut panel = Self {
+            backend: PanelBackend::Local,
             cwd,
             entries: Vec::new(),
             selected: 0,
@@ -242,26 +304,14 @@ impl PanelState {
     }
 
     pub fn reload(&mut self) -> Result<()> {
+        if self.backend != PanelBackend::Local {
+            return Err(anyhow!("reload local invocado en panel remoto"));
+        }
         self.entries = read_dir_entries(&self.cwd, self.sort_mode, self.sort_order, self.show_hidden)?;
         if self.selected >= self.entries.len() {
             self.selected = self.entries.len().saturating_sub(1);
         }
         Ok(())
-    }
-
-    pub fn cycle_sort_mode(&mut self) -> Result<()> {
-        self.sort_mode = self.sort_mode.next();
-        self.reload()
-    }
-
-    pub fn toggle_sort_order(&mut self) -> Result<()> {
-        self.sort_order = self.sort_order.toggle();
-        self.reload()
-    }
-
-    pub fn toggle_show_hidden(&mut self) -> Result<()> {
-        self.show_hidden = !self.show_hidden;
-        self.reload()
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -354,18 +404,35 @@ pub struct App {
     pub rename_input: Option<RenameInputDialog>,
     pub mkdir_input: Option<MkdirInputDialog>,
     pub search_input: Option<SearchInputDialog>,
+    pub remote_connection_input: Option<RemoteConnectionDialog>,
+    pub saved_connections: Vec<SavedConnection>,
     pub pending_rename: Option<PendingRenamePlan>,
     pub pending_mkdir: Option<PathBuf>,
     pub pending_overwrite: Option<OverwriteBatchState>,
+    pub pending_saved_connection_delete: Option<usize>,
     pub confirmation: Option<ConfirmationDialog>,
     pub exit_dir: Option<PathBuf>,
     pub should_quit: bool,
     pub status_message: String,
+    pub config_store: ConfigStore,
+    pub remote_sessions: HashMap<String, RemoteSession>,
+    pub active_transfer: Option<TransferState>,
+}
+
+pub struct TransferState {
+    pub receiver: Receiver<TransferEvent>,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub started_at: Instant,
+    pub source_panel: ActivePanel,
+    pub copied_bytes: u64,
+    pub total_bytes: u64,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
         let cwd = std::env::current_dir().context("No se pudo obtener el directorio actual")?;
+        let config_store = ConfigStore::new()?;
+        let saved_connections = config_store.load_connections().unwrap_or_default();
         Ok(Self {
             left: PanelState::new(cwd.clone())?,
             right: PanelState::new(cwd)?,
@@ -378,14 +445,134 @@ impl App {
             rename_input: None,
             mkdir_input: None,
             search_input: None,
+            remote_connection_input: None,
+            saved_connections,
             pending_rename: None,
             pending_mkdir: None,
             pending_overwrite: None,
+            pending_saved_connection_delete: None,
             confirmation: None,
             exit_dir: None,
             should_quit: false,
             status_message: "Listo".to_string(),
+            config_store,
+            remote_sessions: HashMap::new(),
+            active_transfer: None,
         })
+    }
+
+    pub fn advance_transfer(&mut self) -> Result<()> {
+        let mut completed_event = None;
+
+        if let Some(state) = &mut self.active_transfer {
+            loop {
+                match state.receiver.try_recv() {
+                    Ok(TransferEvent::Progress {
+                        copied_bytes,
+                        total_bytes,
+                        current_item,
+                    }) => {
+                        state.copied_bytes = copied_bytes;
+                        state.total_bytes = total_bytes;
+                        let elapsed = state.started_at.elapsed().as_secs_f64().max(0.001);
+                        let speed_mib = copied_bytes as f64 / 1024.0 / 1024.0 / elapsed;
+                        let percent = if total_bytes == 0 {
+                            0.0
+                        } else {
+                            (copied_bytes as f64 * 100.0) / total_bytes as f64
+                        };
+                        self.status_message = format!(
+                            "Copiando {:.1}% ({:.1}/{:.1} MiB) {:.1} MiB/s | {}",
+                            percent,
+                            copied_bytes as f64 / 1024.0 / 1024.0,
+                            total_bytes as f64 / 1024.0 / 1024.0,
+                            speed_mib,
+                            current_item
+                        );
+                    }
+                    Ok(TransferEvent::Finished {
+                        copied_bytes,
+                        total_bytes,
+                        processed,
+                        failed,
+                        skipped,
+                        error,
+                    }) => {
+                        completed_event = Some((
+                            state.source_panel,
+                            copied_bytes,
+                            total_bytes,
+                            processed,
+                            failed,
+                            skipped,
+                            error,
+                        ));
+                        break;
+                    }
+                    Ok(TransferEvent::Cancelled {
+                        copied_bytes,
+                        total_bytes,
+                        processed,
+                        failed,
+                        skipped,
+                    }) => {
+                        completed_event = Some((
+                            state.source_panel,
+                            copied_bytes,
+                            total_bytes,
+                            processed,
+                            failed,
+                            skipped,
+                            Some("__CANCELLED_BY_USER__".to_string()),
+                        ));
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        completed_event = Some((
+                            state.source_panel,
+                            state.copied_bytes,
+                            state.total_bytes,
+                            0,
+                            1,
+                            0,
+                            Some("Canal de transferencia desconectado".to_string()),
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((source_panel, copied, total, processed, failed, skipped, error)) = completed_event {
+            self.active_transfer = None;
+            self.panel_mut(source_panel).clear_marks();
+            let _ = self.reload_panels();
+
+            if let Some(error) = error {
+                if error == "__CANCELLED_BY_USER__" {
+                    self.status_message = format!(
+                        "Transferencia cancelada ({:.1}/{:.1} MiB)",
+                        copied as f64 / 1024.0 / 1024.0,
+                        total as f64 / 1024.0 / 1024.0
+                    );
+                } else {
+                    self.status_message = format!("Transferencia fallida: {}", error);
+                }
+            } else {
+                let percent = if total == 0 {
+                    100.0
+                } else {
+                    (copied as f64 * 100.0) / total as f64
+                };
+                self.status_message = format!(
+                    "Transferencia completada {:.1}% | procesados {} | omitidos {} | fallidos {}",
+                    percent, processed, skipped, failed
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -422,6 +609,15 @@ impl App {
             return self.handle_search_input_key(key);
         }
 
+        if self.remote_connection_input.is_some() {
+            return self.handle_remote_connection_input_key(key);
+        }
+
+        if self.active_transfer.is_some() && key.code == KeyCode::Esc {
+            self.request_cancel_transfer();
+            return Ok(());
+        }
+
         if matches!(self.mode, AppMode::Viewer(_)) {
             return self.handle_viewer_key(key);
         }
@@ -431,7 +627,13 @@ impl App {
         }
 
         match key.code {
-            KeyCode::F(2) => self.open_search_input(),
+            KeyCode::F(2) => {
+                if self.active_panel().backend == PanelBackend::Local {
+                    self.open_search_input();
+                } else {
+                    self.status_message = "Busqueda en panel remoto se habilitara en una fase posterior".to_string();
+                }
+            }
             KeyCode::F(1) => {
                 self.show_help = true;
             }
@@ -450,38 +652,77 @@ impl App {
             KeyCode::Backspace => self.go_parent()?,
             KeyCode::Char(' ') => self.active_panel_mut().toggle_mark(),
             KeyCode::F(3) => self.preview_selected(),
-            KeyCode::F(5) => self.open_confirmation(PendingAction::Copy),
-            KeyCode::F(6) => self.open_rename_input(),
-            KeyCode::F(7) => self.open_mkdir_input(),
-            KeyCode::F(8) => self.open_confirmation(PendingAction::Delete),
+            KeyCode::F(5) => {
+                if self.active_transfer.is_some() {
+                    self.status_message = "Espera a que termine la transferencia actual".to_string();
+                } else {
+                    self.open_confirmation(PendingAction::Copy)
+                }
+            }
+            KeyCode::F(6) => {
+                if self.active_transfer.is_some() {
+                    self.status_message = "Espera a que termine la transferencia actual".to_string();
+                } else {
+                    self.open_rename_input()
+                }
+            }
+            KeyCode::F(7) => {
+                if self.active_transfer.is_some() {
+                    self.status_message = "Espera a que termine la transferencia actual".to_string();
+                } else {
+                    self.open_mkdir_input()
+                }
+            }
+            KeyCode::F(8) => {
+                if self.active_transfer.is_some() {
+                    self.status_message = "Espera a que termine la transferencia actual".to_string();
+                } else {
+                    self.open_confirmation(PendingAction::Delete)
+                }
+            }
+            KeyCode::F(12) => self.open_remote_connection_input(),
             KeyCode::F(9) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                let panel = self.active_panel_mut();
-                panel.toggle_sort_order()?;
+                {
+                    let panel = self.active_panel_mut();
+                    panel.sort_order = panel.sort_order.toggle();
+                }
+                self.reload_active_panel()?;
+                let panel = self.active_panel();
                 self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
             }
             KeyCode::F(9) => {
-                let panel = self.active_panel_mut();
-                panel.cycle_sort_mode()?;
+                {
+                    let panel = self.active_panel_mut();
+                    panel.sort_mode = panel.sort_mode.next();
+                }
+                self.reload_active_panel()?;
+                let panel = self.active_panel();
                 self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
             }
             KeyCode::F(4) => {
-                let panel = self.active_panel_mut();
-                panel.toggle_show_hidden()?;
-                self.status_message = if panel.show_hidden {
+                let show_hidden = {
+                    let panel = self.active_panel_mut();
+                    panel.show_hidden = !panel.show_hidden;
+                    panel.show_hidden
+                };
+                self.reload_active_panel()?;
+                self.status_message = if show_hidden {
                     "Ocultos visibles".to_string()
                 } else {
                     "Ocultos ocultos".to_string()
                 };
             }
-            KeyCode::F(12) => {
-                let panel = self.active_panel_mut();
-                panel.toggle_sort_order()?;
-                self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
-            }
             KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
             _ => {}
         }
         Ok(())
+    }
+
+    fn request_cancel_transfer(&mut self) {
+        if let Some(transfer) = &self.active_transfer {
+            transfer.cancel_flag.store(true, AtomicOrdering::Relaxed);
+            self.status_message = "Cancelando transferencia...".to_string();
+        }
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, left_panel_width: u16) {
@@ -516,10 +757,179 @@ impl App {
         }
     }
 
+    pub fn inactive_panel(&self) -> &PanelState {
+        match self.active_panel {
+            ActivePanel::Left => &self.right,
+            ActivePanel::Right => &self.left,
+        }
+    }
+
     pub fn active_panel_mut(&mut self) -> &mut PanelState {
         match self.active_panel {
             ActivePanel::Left => &mut self.left,
             ActivePanel::Right => &mut self.right,
+        }
+    }
+
+    fn panel(&self, panel: ActivePanel) -> &PanelState {
+        match panel {
+            ActivePanel::Left => &self.left,
+            ActivePanel::Right => &self.right,
+        }
+    }
+
+    fn panel_mut(&mut self, panel: ActivePanel) -> &mut PanelState {
+        match panel {
+            ActivePanel::Left => &mut self.left,
+            ActivePanel::Right => &mut self.right,
+        }
+    }
+
+    fn reload_panel(&mut self, panel: ActivePanel) -> Result<()> {
+        let (backend, cwd, sort_mode, sort_order, show_hidden, selected) = {
+            let state = self.panel(panel);
+            (
+                state.backend.clone(),
+                state.cwd.clone(),
+                state.sort_mode,
+                state.sort_order,
+                state.show_hidden,
+                state.selected,
+            )
+        };
+
+        let entries = match backend {
+            PanelBackend::Local => read_dir_entries(&cwd, sort_mode, sort_order, show_hidden)?,
+            PanelBackend::Remote { connection_name } => {
+                let session = self
+                    .remote_sessions
+                    .get(&connection_name)
+                    .ok_or_else(|| anyhow!("Sesion remota no disponible: {connection_name}"))?;
+                session.list_dir(&cwd, sort_mode, sort_order, show_hidden)?
+            }
+        };
+
+        let state = self.panel_mut(panel);
+        state.entries = entries;
+        state.selected = if state.entries.is_empty() {
+            0
+        } else {
+            selected.min(state.entries.len().saturating_sub(1))
+        };
+        Ok(())
+    }
+
+    fn reload_active_panel(&mut self) -> Result<()> {
+        self.reload_panel(self.active_panel)
+    }
+
+    fn remote_session_for(&self, connection_name: &str) -> Result<&RemoteSession> {
+        self.remote_sessions
+            .get(connection_name)
+            .ok_or_else(|| anyhow!("Sesion remota no disponible: {connection_name}"))
+    }
+
+    fn transfer_backend_from_panel_backend(&self, backend: &PanelBackend) -> Result<TransferBackend> {
+        match backend {
+            PanelBackend::Local => Ok(TransferBackend::Local),
+            PanelBackend::Remote { connection_name } => {
+                let session = self.remote_session_for(connection_name)?;
+                let (connection, password) = session.snapshot_credentials();
+                Ok(TransferBackend::Remote {
+                    connection,
+                    password,
+                })
+            }
+        }
+    }
+
+    fn path_exists_on_backend(&self, backend: &PanelBackend, path: &Path) -> Result<bool> {
+        match backend {
+            PanelBackend::Local => Ok(path.exists()),
+            PanelBackend::Remote { connection_name } => {
+                let session = self.remote_session_for(connection_name)?;
+                Ok(session.exists(path))
+            }
+        }
+    }
+
+    fn copy_between_backends(
+        &self,
+        source_backend: &PanelBackend,
+        destination_backend: &PanelBackend,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        match (source_backend, destination_backend) {
+            (PanelBackend::Local, PanelBackend::Local) => {
+                apply_batch_operation(OverwriteOperation::Copy, source, destination)
+            }
+            (PanelBackend::Local, PanelBackend::Remote { connection_name }) => self
+                .remote_session_for(connection_name)?
+                .copy_local_to_remote(source, destination),
+            (PanelBackend::Remote { connection_name }, PanelBackend::Local) => self
+                .remote_session_for(connection_name)?
+                .copy_remote_to_local(source, destination),
+            (
+                PanelBackend::Remote {
+                    connection_name: source_conn,
+                },
+                PanelBackend::Remote {
+                    connection_name: destination_conn,
+                },
+            ) if source_conn == destination_conn => self
+                .remote_session_for(source_conn)?
+                .copy_remote_to_remote(source, destination),
+            (PanelBackend::Remote { .. }, PanelBackend::Remote { .. }) => {
+                Err(anyhow!("Copia entre dos conexiones remotas distintas no soportada aun"))
+            }
+        }
+    }
+
+    fn remove_on_backend(&self, backend: &PanelBackend, path: &Path) -> Result<()> {
+        match backend {
+            PanelBackend::Local => remove_path_recursive(path),
+            PanelBackend::Remote { connection_name } => {
+                self.remote_session_for(connection_name)?.remove_recursive(path)
+            }
+        }
+    }
+
+    fn mkdir_on_backend(&self, backend: &PanelBackend, path: &Path) -> Result<()> {
+        match backend {
+            PanelBackend::Local => fs::create_dir_all(path)
+                .with_context(|| format!("No se pudo crear directorio {}", path.display())),
+            PanelBackend::Remote { connection_name } => {
+                self.remote_session_for(connection_name)?.create_dir_all(path)
+            }
+        }
+    }
+
+    fn move_between_backends(
+        &self,
+        source_backend: &PanelBackend,
+        destination_backend: &PanelBackend,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        match (source_backend, destination_backend) {
+            (PanelBackend::Local, PanelBackend::Local) => {
+                apply_batch_operation(OverwriteOperation::Move, source, destination)
+            }
+            (
+                PanelBackend::Remote {
+                    connection_name: source_conn,
+                },
+                PanelBackend::Remote {
+                    connection_name: destination_conn,
+                },
+            ) if source_conn == destination_conn => self
+                .remote_session_for(source_conn)?
+                .rename(source, destination),
+            _ => {
+                self.copy_between_backends(source_backend, destination_backend, source, destination)?;
+                self.remove_on_backend(source_backend, source)
+            }
         }
     }
 
@@ -547,10 +957,12 @@ impl App {
         let selected = self.active_panel().selected_entry().cloned();
         if let Some(entry) = selected {
             if entry.is_dir {
-                let panel = self.active_panel_mut();
-                panel.cwd = entry.path;
-                panel.selected = 0;
-                panel.reload()?;
+                {
+                    let panel = self.active_panel_mut();
+                    panel.cwd = entry.path;
+                    panel.selected = 0;
+                }
+                self.reload_active_panel()?;
             } else {
                 self.status_message = format!("Seleccionado: {}", entry.name);
             }
@@ -559,11 +971,14 @@ impl App {
     }
 
     fn go_parent(&mut self) -> Result<()> {
-        let panel = self.active_panel_mut();
-        if let Some(parent) = panel.cwd.parent() {
-            panel.cwd = parent.to_path_buf();
-            panel.selected = 0;
-            panel.reload()?;
+        let parent = self.active_panel().cwd.parent().map(Path::to_path_buf);
+        if let Some(parent) = parent {
+            {
+                let panel = self.active_panel_mut();
+                panel.cwd = parent;
+                panel.selected = 0;
+            }
+            self.reload_active_panel()?;
         }
         Ok(())
     }
@@ -574,6 +989,257 @@ impl App {
             input: String::new(),
         });
         self.status_message = "F2: ingrese texto o patron (ej. *.rs type:md)".to_string();
+    }
+
+    fn open_remote_connection_input(&mut self) {
+        let mut dialog = RemoteConnectionDialog {
+            host: String::new(),
+            port: "22".to_string(),
+            username: String::new(),
+            password: String::new(),
+            save_connection: true,
+            selected_saved: None,
+            selected_field: RemoteConnectionField::Host,
+        };
+
+        if !self.saved_connections.is_empty() {
+            dialog.selected_saved = Some(0);
+            Self::apply_selected_saved_connection(&mut dialog, &self.saved_connections, 0);
+        }
+
+        self.remote_connection_input = Some(dialog);
+        self.status_message = "F12: complete datos SCP y Enter para guardar/conectar".to_string();
+    }
+
+    fn handle_remote_connection_input_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.remote_connection_input = None;
+                self.status_message = "Conexion remota cancelada".to_string();
+            }
+            KeyCode::Tab => {
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    dialog.selected_field = dialog.selected_field.next();
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    dialog.selected_field = dialog.selected_field.prev();
+                }
+            }
+            KeyCode::Up => {
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    if self.saved_connections.is_empty() {
+                        return Ok(());
+                    }
+                    let current = dialog.selected_saved.unwrap_or(0);
+                    let next = current.saturating_sub(1);
+                    dialog.selected_saved = Some(next);
+                    Self::apply_selected_saved_connection(dialog, &self.saved_connections, next);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    if self.saved_connections.is_empty() {
+                        return Ok(());
+                    }
+                    let current = dialog.selected_saved.unwrap_or(0);
+                    let next = (current + 1).min(self.saved_connections.len().saturating_sub(1));
+                    dialog.selected_saved = Some(next);
+                    Self::apply_selected_saved_connection(dialog, &self.saved_connections, next);
+                }
+            }
+            KeyCode::Delete => {
+                let selected = self
+                    .remote_connection_input
+                    .as_ref()
+                    .and_then(|dialog| dialog.selected_saved);
+
+                if let Some(index) = selected {
+                    if let Some(connection) = self.saved_connections.get(index) {
+                        self.pending_saved_connection_delete = Some(index);
+                        self.confirmation = Some(ConfirmationDialog {
+                            action: PendingAction::DeleteSavedConnection,
+                            message: format!(
+                                "Eliminar conexion guardada '{}' ?",
+                                connection.name
+                            ),
+                        });
+                    } else {
+                        self.status_message = "No hay conexion valida para eliminar".to_string();
+                    }
+                } else {
+                    self.status_message = "No hay conexion seleccionada para eliminar".to_string();
+                }
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.remote_connection_input.take() else {
+                    return Ok(());
+                };
+
+                let host = dialog.host.trim().to_string();
+                let username = dialog.username.trim().to_string();
+                if host.is_empty() || username.is_empty() {
+                    self.remote_connection_input = Some(dialog);
+                    self.status_message = "Host y usuario son obligatorios".to_string();
+                    return Ok(());
+                }
+
+                let port: u16 = match dialog.port.trim().parse() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        self.remote_connection_input = Some(dialog);
+                        self.status_message = "Puerto invalido (use 1..65535)".to_string();
+                        return Ok(());
+                    }
+                };
+
+                if dialog.password.is_empty() {
+                    self.remote_connection_input = Some(dialog);
+                    self.status_message = "Ingrese contrasena para conectar por SCP".to_string();
+                    return Ok(());
+                }
+
+                let connection_name = Self::build_connection_name(&host, &username, port);
+                let connection = SavedConnection {
+                    name: connection_name.clone(),
+                    host: host.clone(),
+                    port,
+                    username: username.clone(),
+                };
+
+                let session = RemoteSession::connect(&connection, &dialog.password)?;
+                let remote_home = session.home_dir.clone();
+                self.remote_sessions.insert(connection_name.clone(), session);
+
+                if dialog.save_connection {
+                    self.upsert_saved_connection(&host, port, &username)?;
+                }
+
+                {
+                    let panel = self.active_panel_mut();
+                    panel.backend = PanelBackend::Remote {
+                        connection_name: connection_name.clone(),
+                    };
+                    panel.cwd = remote_home;
+                    panel.selected = 0;
+                    panel.clear_marks();
+                }
+                self.reload_active_panel()?;
+
+                self.status_message = format!("Conectado a {}", connection_name);
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    match dialog.selected_field {
+                        RemoteConnectionField::Host => {
+                            dialog.host.pop();
+                        }
+                        RemoteConnectionField::Port => {
+                            dialog.port.pop();
+                        }
+                        RemoteConnectionField::Username => {
+                            dialog.username.pop();
+                        }
+                        RemoteConnectionField::Password => {
+                            dialog.password.pop();
+                        }
+                        RemoteConnectionField::Save => {}
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    if matches!(dialog.selected_field, RemoteConnectionField::Save) {
+                        dialog.save_connection = !dialog.save_connection;
+                    } else {
+                        match dialog.selected_field {
+                            RemoteConnectionField::Host => dialog.host.push(' '),
+                            RemoteConnectionField::Port => {}
+                            RemoteConnectionField::Username => dialog.username.push(' '),
+                            RemoteConnectionField::Password => dialog.password.push(' '),
+                            RemoteConnectionField::Save => {}
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if c.is_control() {
+                    return Ok(());
+                }
+                if let Some(dialog) = &mut self.remote_connection_input {
+                    match dialog.selected_field {
+                        RemoteConnectionField::Host => dialog.host.push(c),
+                        RemoteConnectionField::Port => {
+                            if c.is_ascii_digit() {
+                                dialog.port.push(c);
+                            }
+                        }
+                        RemoteConnectionField::Username => dialog.username.push(c),
+                        RemoteConnectionField::Password => dialog.password.push(c),
+                        RemoteConnectionField::Save => {
+                            if c == 's' || c == 'S' {
+                                dialog.save_connection = !dialog.save_connection;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_selected_saved_connection(
+        dialog: &mut RemoteConnectionDialog,
+        connections: &[SavedConnection],
+        index: usize,
+    ) {
+        if let Some(saved) = connections.get(index) {
+            dialog.host = saved.host.clone();
+            dialog.port = saved.port.to_string();
+            dialog.username = saved.username.clone();
+            dialog.password.clear();
+            dialog.save_connection = true;
+        }
+    }
+
+    fn build_connection_name(host: &str, username: &str, port: u16) -> String {
+        format!("{}@{}:{}", username, host, port)
+    }
+
+    fn upsert_saved_connection(&mut self, host: &str, port: u16, username: &str) -> Result<()> {
+        let name = Self::build_connection_name(host, username, port);
+        let new_item = SavedConnection {
+            name: name.clone(),
+            host: host.to_string(),
+            port,
+            username: username.to_string(),
+        };
+
+        if let Some(existing) = self
+            .saved_connections
+            .iter_mut()
+            .find(|item| item.host == host && item.port == port && item.username == username)
+        {
+            *existing = new_item;
+        } else {
+            self.saved_connections.push(new_item);
+            self.saved_connections
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+
+        self.config_store
+            .save_connections(&self.saved_connections)
+            .with_context(|| {
+                format!(
+                    "No se pudo guardar conexiones en {}",
+                    self.config_store.config_path().display()
+                )
+            })?;
+
+        self.status_message = format!("Conexion guardada: {}", name);
+        Ok(())
     }
 
     fn search_state_mut(&mut self) -> Option<&mut SearchState> {
@@ -766,12 +1432,15 @@ impl App {
             return Ok(());
         };
 
-        let panel = self.active_panel_mut();
         if entry.is_dir {
-            panel.cwd = entry.path;
-            panel.selected = 0;
-            panel.reload()?;
-            self.status_message = format!("Directorio abierto: {}", panel.cwd.display());
+            {
+                let panel = self.active_panel_mut();
+                panel.cwd = entry.path;
+                panel.selected = 0;
+            }
+            self.reload_active_panel()?;
+            let cwd = self.active_panel().cwd.clone();
+            self.status_message = format!("Directorio abierto: {}", cwd.display());
             return Ok(());
         }
 
@@ -780,17 +1449,26 @@ impl App {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| state.root_dir.clone());
-        panel.cwd = parent;
-        panel.selected = 0;
-        panel.reload()?;
+        {
+            let panel = self.active_panel_mut();
+            panel.cwd = parent;
+            panel.selected = 0;
+        }
+        self.reload_active_panel()?;
 
-        if let Some(index) = panel.entries.iter().position(|item| item.path == entry.path) {
-            panel.selected = index;
+        if let Some(index) = self
+            .active_panel()
+            .entries
+            .iter()
+            .position(|item| item.path == entry.path)
+        {
+            self.active_panel_mut().selected = index;
         }
 
+        let cwd = self.active_panel().cwd.clone();
         self.status_message = format!(
             "Directorio abierto: {} (archivo seleccionado: {})",
-            panel.cwd.display(),
+            cwd.display(),
             entry.name
         );
         Ok(())
@@ -838,7 +1516,26 @@ impl App {
                 return;
             }
 
-            match ViewerState::open(&entry.path) {
+            let backend = self.active_panel().backend.clone();
+            let result = match backend {
+                PanelBackend::Local => ViewerState::open(&entry.path),
+                PanelBackend::Remote { connection_name } => {
+                    let session = match self.remote_session_for(&connection_name) {
+                        Ok(session) => session,
+                        Err(error) => {
+                            self.status_message = format!("No hay sesion remota: {error}");
+                            return;
+                        }
+                    };
+
+                    match session.read_file_bytes(&entry.path) {
+                        Ok(bytes) => ViewerState::from_bytes(entry.path.clone(), bytes),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+
+            match result {
                 Ok(viewer) => {
                     self.mode = AppMode::Viewer(viewer);
                     self.status_message = format!("Visualizando: {}", entry.name);
@@ -1013,6 +1710,14 @@ impl App {
                     self.pending_mkdir = None;
                     self.pending_overwrite = None;
                 }
+
+                if self
+                    .confirmation
+                    .as_ref()
+                    .is_some_and(|dialog| matches!(dialog.action, PendingAction::DeleteSavedConnection))
+                {
+                    self.pending_saved_connection_delete = None;
+                }
                 self.confirmation = None;
                 self.status_message = "Operacion cancelada".to_string();
             }
@@ -1060,6 +1765,9 @@ impl App {
                     )
                 }
             }
+            PendingAction::DeleteSavedConnection => {
+                "Eliminar conexion guardada?".to_string()
+            }
             PendingAction::Quit => "Salir de la aplicacion?".to_string(),
         };
 
@@ -1091,8 +1799,51 @@ impl App {
             PendingAction::Delete => {
                 self.confirm_delete();
             }
+            PendingAction::DeleteSavedConnection => {
+                self.confirm_delete_saved_connection()?;
+            }
         }
 
+        Ok(())
+    }
+
+    fn confirm_delete_saved_connection(&mut self) -> Result<()> {
+        let Some(index) = self.pending_saved_connection_delete.take() else {
+            self.status_message = "No hay conexion pendiente de eliminar".to_string();
+            return Ok(());
+        };
+
+        if index >= self.saved_connections.len() {
+            self.status_message = "La conexion ya no existe".to_string();
+            return Ok(());
+        }
+
+        let removed = self.saved_connections.remove(index);
+        self.config_store
+            .save_connections(&self.saved_connections)
+            .with_context(|| {
+                format!(
+                    "No se pudo guardar conexiones en {}",
+                    self.config_store.config_path().display()
+                )
+            })?;
+
+        if let Some(dialog) = &mut self.remote_connection_input {
+            if self.saved_connections.is_empty() {
+                dialog.selected_saved = None;
+                dialog.host.clear();
+                dialog.port = "22".to_string();
+                dialog.username.clear();
+                dialog.password.clear();
+                dialog.selected_field = RemoteConnectionField::Host;
+            } else {
+                let next = index.min(self.saved_connections.len().saturating_sub(1));
+                dialog.selected_saved = Some(next);
+                Self::apply_selected_saved_connection(dialog, &self.saved_connections, next);
+            }
+        }
+
+        self.status_message = format!("Conexion eliminada: {}", removed.name);
         Ok(())
     }
 
@@ -1103,11 +1854,13 @@ impl App {
             return;
         }
 
+        let active_backend = self.active_panel().backend.clone();
+
         let mut deleted = 0usize;
         let mut failed = 0usize;
 
         for source in &sources {
-            match remove_path_recursive(source) {
+            match self.remove_on_backend(&active_backend, source) {
                 Ok(()) => deleted += 1,
                 Err(_) => failed += 1,
             }
@@ -1129,22 +1882,56 @@ impl App {
     }
 
     fn confirm_copy(&mut self) -> Result<()> {
+        if self.active_transfer.is_some() {
+            self.status_message = "Ya hay una transferencia en curso".to_string();
+            return Ok(());
+        }
+
         let sources = self.active_panel().operation_source_paths();
         if sources.is_empty() {
             self.status_message = "No hay elementos validos para copiar".to_string();
             return Ok(());
         }
 
-        self.pending_overwrite = Some(OverwriteBatchState {
-            remaining_sources: sources,
-            destination_dir: self.inactive_panel_cwd().to_path_buf(),
-            processed: 0,
-            skipped: 0,
-            current_conflict_source: None,
-            operation: OverwriteOperation::Copy,
+        let source_backend = self.active_panel().backend.clone();
+        let destination_backend = self.inactive_panel().backend.clone();
+        let destination_dir = self.inactive_panel_cwd().to_path_buf();
+
+        if source_backend == PanelBackend::Local && destination_backend == PanelBackend::Local {
+            self.pending_overwrite = Some(OverwriteBatchState {
+                remaining_sources: sources,
+                destination_dir,
+                processed: 0,
+                skipped: 0,
+                current_conflict_source: None,
+                operation: OverwriteOperation::Copy,
+            });
+            self.advance_overwrite_batch()?;
+            return Ok(());
+        }
+
+        let source_transfer_backend = self.transfer_backend_from_panel_backend(&source_backend)?;
+        let destination_transfer_backend =
+            self.transfer_backend_from_panel_backend(&destination_backend)?;
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let receiver = spawn_copy_worker(CopyJob {
+            source_backend: source_transfer_backend,
+            destination_backend: destination_transfer_backend,
+            sources,
+            destination_dir,
+            cancel_flag: Arc::clone(&cancel_flag),
         });
-        self.advance_overwrite_batch()?;
-        Ok(())
+        let source_panel = self.active_panel;
+        self.active_transfer = Some(TransferState {
+            receiver,
+            cancel_flag,
+            started_at: Instant::now(),
+            source_panel,
+            copied_bytes: 0,
+            total_bytes: 0,
+        });
+        self.status_message = "Transferencia remota iniciada...".to_string();
+        return Ok(());
     }
 
     fn open_mkdir_input(&mut self) {
@@ -1161,13 +1948,14 @@ impl App {
             return Ok(());
         };
 
-        if target.exists() {
+        let backend = self.active_panel().backend.clone();
+
+        if self.path_exists_on_backend(&backend, &target)? {
             self.status_message = format!("No se puede crear: {} ya existe", target.display());
             return Ok(());
         }
 
-        fs::create_dir_all(&target)
-            .with_context(|| format!("No se pudo crear directorio {}", target.display()))?;
+        self.mkdir_on_backend(&backend, &target)?;
 
         self.reload_panels()?;
         self.status_message = format!("Directorio creado: {}", target.display());
@@ -1211,12 +1999,14 @@ impl App {
                 return Some(PendingRenamePlan::Single(RenamePlan {
                     source,
                     destination: dialog.default_move_dir.join(name),
+                    destination_backend: self.inactive_panel().backend.clone(),
                 }));
             }
 
             return Some(PendingRenamePlan::Multiple {
                 sources: dialog.sources,
                 destination_dir: dialog.default_move_dir,
+                destination_backend: self.inactive_panel().backend.clone(),
             });
         }
 
@@ -1247,6 +2037,7 @@ impl App {
         Some(PendingRenamePlan::Single(RenamePlan {
             source,
             destination,
+            destination_backend: self.active_panel().backend.clone(),
         }))
     }
 
@@ -1258,7 +2049,9 @@ impl App {
 
         match plan {
             PendingRenamePlan::Single(plan) => {
-                if plan.destination.exists() {
+                let source_backend = self.active_panel().backend.clone();
+
+                if self.path_exists_on_backend(&plan.destination_backend, &plan.destination)? {
                     self.status_message = format!(
                         "No se puede mover: el destino {} ya existe",
                         plan.destination.display()
@@ -1271,7 +2064,7 @@ impl App {
                     return Ok(());
                 };
 
-                if !parent.exists() {
+                if !self.path_exists_on_backend(&plan.destination_backend, parent)? {
                     self.status_message = format!(
                         "No se puede mover: el directorio {} no existe",
                         parent.display()
@@ -1279,13 +2072,12 @@ impl App {
                     return Ok(());
                 }
 
-                fs::rename(&plan.source, &plan.destination).with_context(|| {
-                    format!(
-                        "No se pudo mover {} a {}",
-                        plan.source.display(),
-                        plan.destination.display()
-                    )
-                })?;
+                self.move_between_backends(
+                    &source_backend,
+                    &plan.destination_backend,
+                    &plan.source,
+                    &plan.destination,
+                )?;
 
                 self.active_panel_mut().clear_marks();
                 self.reload_panels()?;
@@ -1298,8 +2090,11 @@ impl App {
             PendingRenamePlan::Multiple {
                 sources,
                 destination_dir,
+                destination_backend,
             } => {
-                if !destination_dir.exists() || !destination_dir.is_dir() {
+                let source_backend = self.active_panel().backend.clone();
+
+                if !self.path_exists_on_backend(&destination_backend, &destination_dir)? {
                     self.status_message = format!(
                         "No se puede mover: {} no es un directorio valido",
                         destination_dir.display()
@@ -1307,15 +2102,52 @@ impl App {
                     return Ok(());
                 }
 
-                self.pending_overwrite = Some(OverwriteBatchState {
-                    remaining_sources: sources,
-                    destination_dir,
-                    processed: 0,
-                    skipped: 0,
-                    current_conflict_source: None,
-                    operation: OverwriteOperation::Move,
-                });
-                self.advance_overwrite_batch()?;
+                if source_backend == PanelBackend::Local && destination_backend == PanelBackend::Local {
+                    self.pending_overwrite = Some(OverwriteBatchState {
+                        remaining_sources: sources,
+                        destination_dir,
+                        processed: 0,
+                        skipped: 0,
+                        current_conflict_source: None,
+                        operation: OverwriteOperation::Move,
+                    });
+                    self.advance_overwrite_batch()?;
+                    return Ok(());
+                }
+
+                let mut moved = 0usize;
+                let mut failed = 0usize;
+                let mut skipped = 0usize;
+
+                for source in &sources {
+                    let Some(name) = source.file_name() else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let destination = destination_dir.join(name);
+                    if self.path_exists_on_backend(&destination_backend, &destination)? {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    match self.move_between_backends(
+                        &source_backend,
+                        &destination_backend,
+                        source,
+                        &destination,
+                    ) {
+                        Ok(()) => moved += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+
+                self.active_panel_mut().clear_marks();
+                self.reload_panels()?;
+                self.status_message = format!(
+                    "Movidos {} y omitidos {} (fallidos {}) elemento(s)",
+                    moved, skipped, failed
+                );
+                return Ok(());
             }
         }
 
@@ -1332,6 +2164,7 @@ impl App {
             PendingRenamePlan::Multiple {
                 sources,
                 destination_dir,
+                destination_backend: _,
             } => format!(
                 "Mover {} elemento(s) a {}?",
                 sources.len(),
@@ -1424,8 +2257,8 @@ impl App {
     }
 
     fn reload_panels(&mut self) -> Result<()> {
-        self.left.reload()?;
-        self.right.reload()?;
+        self.reload_panel(ActivePanel::Left)?;
+        self.reload_panel(ActivePanel::Right)?;
         Ok(())
     }
 
@@ -1441,6 +2274,13 @@ impl App {
     }
 
     fn compute_exit_directory(&self) -> PathBuf {
+        if self.active_panel().backend != PanelBackend::Local {
+            if self.inactive_panel().backend == PanelBackend::Local {
+                return self.inactive_panel().cwd.clone();
+            }
+            return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        }
+
         if let Some(entry) = self.active_panel().selected_entry() {
             if entry.is_dir {
                 return entry.path.clone();

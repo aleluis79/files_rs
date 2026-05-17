@@ -13,8 +13,11 @@ pub struct ViewerState {
 
 impl ViewerState {
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes =
-            fs::read(path).with_context(|| format!("No se pudo leer {}", path.display()))?;
+        let bytes = fs::read(path).with_context(|| format!("No se pudo leer {}", path.display()))?;
+        Self::from_bytes(path.to_path_buf(), bytes)
+    }
+
+    pub fn from_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
 
         if bytes.iter().take(4096).any(|byte| *byte == 0) {
             bail!("El archivo no parece ser texto legible");
@@ -27,7 +30,7 @@ impl ViewerState {
             .collect::<Vec<_>>();
 
         Ok(Self {
-            path: path.to_path_buf(),
+            path,
             lines: if lines.is_empty() {
                 vec![String::new()]
             } else {

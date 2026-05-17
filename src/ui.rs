@@ -7,7 +7,7 @@ use ratatui::{
 use users::get_current_username;
 
 use crate::{
-    app::{ActivePanel, App, AppMode, PanelState, SearchState},
+    app::{ActivePanel, App, AppMode, PanelBackend, PanelState, RemoteConnectionField, SearchState},
     viewer::ViewerState,
 };
 
@@ -33,7 +33,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_mkdir_input(frame, app);
         render_rename_input(frame, app);
         render_search_input(frame, app);
+        render_remote_connection_input(frame, app);
         render_confirmation(frame, app);
+        render_transfer_overlay(frame, app);
         render_help(frame, app);
         render_capibara(frame, app);
         return;
@@ -44,7 +46,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_mkdir_input(frame, app);
         render_rename_input(frame, app);
         render_search_input(frame, app);
+        render_remote_connection_input(frame, app);
         render_confirmation(frame, app);
+        render_transfer_overlay(frame, app);
         render_help(frame, app);
         render_capibara(frame, app);
         return;
@@ -97,7 +101,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F4 Ocultos F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP F4 Ocultos Esc Cancela copia F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -112,9 +116,212 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_mkdir_input(frame, app);
     render_rename_input(frame, app);
     render_search_input(frame, app);
+    render_remote_connection_input(frame, app);
     render_confirmation(frame, app);
+    render_transfer_overlay(frame, app);
     render_help(frame, app);
     render_capibara(frame, app);
+}
+
+fn render_transfer_overlay(frame: &mut Frame, app: &App) {
+    let Some(transfer) = &app.active_transfer else {
+        return;
+    };
+
+    let area = centered_rect(frame.area(), 72, 32);
+    let copied = transfer.copied_bytes as f64 / 1024.0 / 1024.0;
+    let total = transfer.total_bytes as f64 / 1024.0 / 1024.0;
+    let ratio = if transfer.total_bytes == 0 {
+        0.0
+    } else {
+        (transfer.copied_bytes as f64 / transfer.total_bytes as f64).clamp(0.0, 1.0)
+    };
+    let elapsed = transfer.started_at.elapsed().as_secs_f64().max(0.001);
+    let speed = copied / elapsed;
+
+    let gauge_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Transferencia remota en curso")
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title("SCP"),
+        )
+        .centered();
+    frame.render_widget(Clear, area);
+    frame.render_widget(title, gauge_area[0]);
+
+    let progress = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Progreso"))
+        .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .ratio(ratio)
+        .label(format!("{:.1}%", ratio * 100.0));
+    frame.render_widget(progress, gauge_area[1]);
+
+    let stats = Paragraph::new(format!(
+        "{:.1}/{:.1} MiB | {:.1} MiB/s",
+        copied, total, speed
+    ))
+    .style(Style::default().fg(Color::White))
+    .block(Block::default().borders(Borders::ALL).title("Velocidad"));
+    frame.render_widget(stats, gauge_area[2]);
+
+    let hint = Paragraph::new("Esc para cancelar transferencia")
+        .style(Style::default().fg(Color::LightRed))
+        .block(Block::default().borders(Borders::ALL).title("Control"));
+    frame.render_widget(hint, gauge_area[3]);
+}
+
+fn render_remote_connection_input(frame: &mut Frame, app: &App) {
+    let Some(dialog) = &app.remote_connection_input else {
+        return;
+    };
+
+    let cursor_char = if app.marquee_tick % 2 == 0 { "|" } else { " " };
+
+    let area = centered_rect(frame.area(), 72, 56);
+    let selected_label = dialog
+        .selected_saved
+        .and_then(|index| app.saved_connections.get(index))
+        .map(|item| item.name.clone())
+        .unwrap_or_else(|| "ninguna".to_string());
+
+    let host_style = if matches!(dialog.selected_field, RemoteConnectionField::Host) {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let port_style = if matches!(dialog.selected_field, RemoteConnectionField::Port) {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let user_style = if matches!(dialog.selected_field, RemoteConnectionField::Username) {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let pass_style = if matches!(dialog.selected_field, RemoteConnectionField::Password) {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let save_style = if matches!(dialog.selected_field, RemoteConnectionField::Save) {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let masked_password = "*".repeat(dialog.password.chars().count());
+    let save_mark = if dialog.save_connection { "[x]" } else { "[ ]" };
+
+    let host_value = if matches!(dialog.selected_field, RemoteConnectionField::Host) {
+        format!("{}{}", dialog.host, cursor_char)
+    } else {
+        dialog.host.clone()
+    };
+    let port_value = if matches!(dialog.selected_field, RemoteConnectionField::Port) {
+        format!("{}{}", dialog.port, cursor_char)
+    } else {
+        dialog.port.clone()
+    };
+    let user_value = if matches!(dialog.selected_field, RemoteConnectionField::Username) {
+        format!("{}{}", dialog.username, cursor_char)
+    } else {
+        dialog.username.clone()
+    };
+    let pass_value = if matches!(dialog.selected_field, RemoteConnectionField::Password) {
+        format!("{}{}", masked_password, cursor_char)
+    } else {
+        masked_password
+    };
+    let save_value = if matches!(dialog.selected_field, RemoteConnectionField::Save) {
+        format!("{} {}", save_mark, cursor_char)
+    } else {
+        save_mark.to_string()
+    };
+
+    let mut lines = vec![
+        Line::from(Span::raw("Conexiones guardadas (Up/Down para cargar):")),
+        Line::from(Span::styled(
+            format!("Seleccionada: {}", selected_label),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Host: ", host_style),
+            Span::styled(host_value, host_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Puerto: ", port_style),
+            Span::styled(port_value, port_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Usuario: ", user_style),
+            Span::styled(user_value, user_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Contrasena: ", pass_style),
+            Span::styled(pass_value, pass_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Guardar conexion: ", save_style),
+            Span::styled(save_value, save_style),
+        ]),
+        Line::from(""),
+    ];
+
+    if app.saved_connections.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No hay conexiones guardadas aun",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::raw("Conexiones:")));
+        for (index, item) in app.saved_connections.iter().enumerate().take(6) {
+            let prefix = if Some(index) == dialog.selected_saved {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{} {}", prefix, item.name),
+                if Some(index) == dialog.selected_saved {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Tab/Shift+Tab cambia campo | Espacio alterna guardar"));
+    lines.push(Line::from("Delete elimina conexion guardada (con confirmacion)"));
+    lines.push(Line::from("Enter guarda y conecta | Esc cancelar"));
+
+    let overlay = Paragraph::new(Text::from(lines))
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title("F12 Conexion SCP"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(overlay, area);
 }
 
 fn render_mkdir_input(frame: &mut Frame, app: &App) {
@@ -217,13 +424,18 @@ fn render_panel(
         .collect::<Vec<_>>();
 
     let hidden_label = if panel.show_hidden { "H:ON" } else { "H:OFF" };
+    let backend_label = match &panel.backend {
+        PanelBackend::Local => "LOCAL".to_string(),
+        PanelBackend::Remote { connection_name } => format!("SCP {}", connection_name),
+    };
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
             .title(format!(
-                "{}: {} [{} {} {}]",
+                "{} [{}]: {} [{} {} {}]",
                 title,
+                backend_label,
                 panel.cwd.display(),
                 panel.sort_mode.label(),
                 panel.sort_order.symbol(),
@@ -710,6 +922,9 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F8  Borrar seleccion (con confirmacion)",
         "F9  Cambiar modo de orden",
         "Shift+F9 Cambiar direccion del orden",
+        "F12 Conexion SCP (conexiones guardadas)",
+        "Delete Elimina conexion SCP guardada (con confirmacion)",
+        "Esc Cancela transferencia en curso",
         "F10 Salir (con confirmacion)",
         "",
         "Tab cambia panel activo",
