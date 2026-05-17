@@ -680,6 +680,9 @@ impl App {
                     self.open_confirmation(PendingAction::Delete)
                 }
             }
+            KeyCode::F(12) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.disconnect_active_remote_panel()?;
+            }
             KeyCode::F(12) => self.open_remote_connection_input(),
             KeyCode::F(9) if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 {
@@ -821,6 +824,53 @@ impl App {
 
     fn reload_active_panel(&mut self) -> Result<()> {
         self.reload_panel(self.active_panel)
+    }
+
+    fn disconnect_active_remote_panel(&mut self) -> Result<()> {
+        if self.active_transfer.is_some() {
+            self.status_message =
+                "No se puede desconectar SCP durante una transferencia activa".to_string();
+            return Ok(());
+        }
+
+        let (connection_name, fallback_local_cwd) = {
+            let active = self.active_panel();
+            let PanelBackend::Remote { connection_name } = &active.backend else {
+                self.status_message = "El panel activo ya es local".to_string();
+                return Ok(());
+            };
+
+            let fallback = if self.inactive_panel().backend == PanelBackend::Local {
+                self.inactive_panel().cwd.clone()
+            } else {
+                std::env::current_dir().context("No se pudo obtener el directorio local actual")?
+            };
+
+            (connection_name.clone(), fallback)
+        };
+
+        {
+            let panel = self.active_panel_mut();
+            panel.backend = PanelBackend::Local;
+            panel.cwd = fallback_local_cwd;
+            panel.selected = 0;
+            panel.clear_marks();
+        }
+        self.reload_active_panel()?;
+
+        let still_in_use = self.left.backend == PanelBackend::Remote {
+            connection_name: connection_name.clone(),
+        } || self.right.backend
+            == PanelBackend::Remote {
+                connection_name: connection_name.clone(),
+            };
+
+        if !still_in_use {
+            self.remote_sessions.remove(&connection_name);
+        }
+
+        self.status_message = format!("Desconectado de {} y vuelto a panel local", connection_name);
+        Ok(())
     }
 
     fn remote_session_for(&self, connection_name: &str) -> Result<&RemoteSession> {

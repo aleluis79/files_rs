@@ -101,7 +101,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP F4 Ocultos Esc Cancela copia F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar F4 Ocultos Esc Cancela copia F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -923,6 +923,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F9  Cambiar modo de orden",
         "Shift+F9 Cambiar direccion del orden",
         "F12 Conexion SCP (conexiones guardadas)",
+        "Shift+F12 Desconecta SCP y vuelve a local",
         "Delete Elimina conexion SCP guardada (con confirmacion)",
         "Esc Cancela transferencia en curso",
         "F10 Salir (con confirmacion)",
