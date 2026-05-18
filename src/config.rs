@@ -11,10 +11,16 @@ pub struct SavedConnection {
     pub username: String,
 }
 
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct AppConfigFile {
+pub struct AppConfigFile {
     #[serde(default)]
-    connections: Vec<SavedConnection>,
+    pub connections: Vec<SavedConnection>,
+    #[serde(default = "default_theme")]
+    pub theme_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -25,13 +31,13 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn new() -> Result<Self> {
         let base = dirs::config_dir().context("No se pudo resolver directorio de configuracion")?;
-        let path = base.join("files-rs").join("connections.toml");
+        let path = base.join("files-rs").join("config.toml");
         Ok(Self { path })
     }
 
-    pub fn load_connections(&self) -> Result<Vec<SavedConnection>> {
+    pub fn load_config(&self) -> Result<AppConfigFile> {
         if !self.path.exists() {
-            return Ok(Vec::new());
+            return Ok(AppConfigFile::default());
         }
 
         let content = fs::read_to_string(&self.path)
@@ -39,12 +45,16 @@ impl ConfigStore {
 
         let parsed: AppConfigFile = toml::from_str(&content)
             .with_context(|| format!("No se pudo parsear {}", self.path.display()))?;
-        Ok(parsed.connections)
+        Ok(parsed)
     }
 
     pub fn save_connections(&self, connections: &[SavedConnection]) -> Result<()> {
+        // Load existing config to preserve theme_name
+        let existing = self.load_config().unwrap_or_default();
+        
         let data = AppConfigFile {
             connections: connections.to_vec(),
+            theme_name: existing.theme_name,
         };
         let serialized = toml::to_string_pretty(&data).context("No se pudo serializar configuracion")?;
 

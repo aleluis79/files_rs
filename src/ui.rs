@@ -8,17 +8,18 @@ use users::get_current_username;
 
 use crate::{
     app::{ActivePanel, App, AppMode, PanelBackend, PanelState, RemoteConnectionField, SearchState},
+    theme::ThemeColors,
     viewer::ViewerState,
 };
 
-fn text_with_blinking_cursor<'a>(input: &'a str, tick: u64) -> Line<'a> {
+fn text_with_blinking_cursor<'a>(input: &'a str, tick: u64, theme: &ThemeColors) -> Line<'a> {
     let cursor_char = "▌";
     let cursor_style = if tick % 2 == 0 {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.header_fg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(theme.text_dim)
     };
 
     Line::from(vec![
@@ -29,7 +30,7 @@ fn text_with_blinking_cursor<'a>(input: &'a str, tick: u64) -> Line<'a> {
 
 pub fn render(frame: &mut Frame, app: &App) {
     if let AppMode::Viewer(viewer) = &app.mode {
-        render_viewer(frame, viewer, &app.status_message);
+        render_viewer(frame, viewer, &app.status_message, &app.theme);
         render_mkdir_input(frame, app);
         render_rename_input(frame, app);
         render_search_input(frame, app);
@@ -42,7 +43,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     if let AppMode::Search(state) = &app.mode {
-        render_search(frame, state, &app.status_message);
+        render_search(frame, state, &app.status_message, &app.theme);
         render_mkdir_input(frame, app);
         render_rename_input(frame, app);
         render_search_input(frame, app);
@@ -66,7 +67,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     let header = Paragraph::new("Files RS")
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.theme.header_fg)
+                .bg(app.theme.panel_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL).title("Titulo"))
@@ -85,6 +87,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.active_panel == ActivePanel::Left,
         "Izquierda",
         app.marquee_tick,
+        &app.theme,
     );
     render_panel(
         frame,
@@ -93,6 +96,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.active_panel == ActivePanel::Right,
         "Derecha",
         app.marquee_tick,
+        &app.theme,
     );
 
     let current = app.active_panel();
@@ -109,7 +113,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.status_message
     );
     let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(app.theme.status_fg).bg(app.theme.panel_bg))
         .block(Block::default().borders(Borders::ALL).title("Estado"));
     frame.render_widget(footer, layout[2]);
 
@@ -151,11 +155,11 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App) {
         .split(area);
 
     let title = Paragraph::new("Transferencia remota en curso")
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(app.theme.header_fg).bg(app.theme.panel_bg).add_modifier(Modifier::BOLD))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightCyan))
+                .border_style(Style::default().fg(app.theme.text_accent))
                 .title("SCP"),
         )
         .centered();
@@ -164,7 +168,7 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App) {
 
     let progress = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title("Progreso"))
-        .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .gauge_style(Style::default().fg(app.theme.gauge_fill).bg(app.theme.gauge_bg))
         .ratio(ratio)
         .label(format!("{:.1}%", ratio * 100.0));
     frame.render_widget(progress, gauge_area[1]);
@@ -173,12 +177,12 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App) {
         "{:.1}/{:.1} MiB | {:.1} MiB/s",
         copied, total, speed
     ))
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
     .block(Block::default().borders(Borders::ALL).title("Velocidad"));
     frame.render_widget(stats, gauge_area[2]);
 
     let hint = Paragraph::new("Esc para cancelar transferencia")
-        .style(Style::default().fg(Color::LightRed))
+        .style(Style::default().fg(app.theme.text_error).bg(app.theme.panel_bg))
         .block(Block::default().borders(Borders::ALL).title("Control"));
     frame.render_widget(hint, gauge_area[3]);
 }
@@ -198,29 +202,29 @@ fn render_remote_connection_input(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "ninguna".to_string());
 
     let host_style = if matches!(dialog.selected_field, RemoteConnectionField::Host) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(app.theme.text_normal)
     };
     let port_style = if matches!(dialog.selected_field, RemoteConnectionField::Port) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(app.theme.text_normal)
     };
     let user_style = if matches!(dialog.selected_field, RemoteConnectionField::Username) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(app.theme.text_normal)
     };
     let pass_style = if matches!(dialog.selected_field, RemoteConnectionField::Password) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(app.theme.text_normal)
     };
     let save_style = if matches!(dialog.selected_field, RemoteConnectionField::Save) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(app.theme.text_normal)
     };
 
     let masked_password = "*".repeat(dialog.password.chars().count());
@@ -256,7 +260,7 @@ fn render_remote_connection_input(frame: &mut Frame, app: &App) {
         Line::from(Span::raw("Conexiones guardadas (Up/Down para cargar):")),
         Line::from(Span::styled(
             format!("Seleccionada: {}", selected_label),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(app.theme.text_accent),
         )),
         Line::from(""),
         Line::from(vec![
@@ -285,7 +289,7 @@ fn render_remote_connection_input(frame: &mut Frame, app: &App) {
     if app.saved_connections.is_empty() {
         lines.push(Line::from(Span::styled(
             "No hay conexiones guardadas aun",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.text_dim),
         )));
     } else {
         lines.push(Line::from(Span::raw("Conexiones:")));
@@ -298,9 +302,9 @@ fn render_remote_connection_input(frame: &mut Frame, app: &App) {
             lines.push(Line::from(Span::styled(
                 format!("{} {}", prefix, item.name),
                 if Some(index) == dialog.selected_saved {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(app.theme.text_success)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(app.theme.text_dim)
                 },
             )));
         }
@@ -312,11 +316,11 @@ fn render_remote_connection_input(frame: &mut Frame, app: &App) {
     lines.push(Line::from("Enter guarda y conecta | Esc cancelar"));
 
     let overlay = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightCyan))
+                .border_style(Style::default().fg(app.theme.text_accent))
                 .title("F12 Conexion SCP"),
         )
         .wrap(Wrap { trim: false });
@@ -334,17 +338,17 @@ fn render_mkdir_input(frame: &mut Frame, app: &App) {
         Line::from(Span::raw(format!("Base: {}", dialog.base_dir.display()))),
         Line::from(""),
         Line::from("Nombre o ruta de directorio:"),
-        text_with_blinking_cursor(&dialog.input, app.marquee_tick),
+        text_with_blinking_cursor(&dialog.input, app.marquee_tick, &app.theme),
         Line::from(""),
         Line::from("Enter confirmar, Esc cancelar, Backspace borrar"),
     ]);
 
     let overlay = Paragraph::new(content)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightGreen))
+                .border_style(Style::default().fg(app.theme.text_success))
                 .title("F7 Crear Directorio"),
         )
         .wrap(Wrap { trim: false });
@@ -359,13 +363,14 @@ fn render_panel(
     is_active: bool,
     title: &str,
     marquee_tick: u64,
+    theme: &ThemeColors,
 ) {
     let border_style = if is_active {
         Style::default()
-            .fg(Color::Green)
+            .fg(theme.border_active)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_inactive)
     };
 
     let visible_rows = area.height.saturating_sub(2) as usize;
@@ -397,9 +402,9 @@ fn render_panel(
                 "     "
             };
             let style = if index == panel.selected {
-                Style::default().bg(Color::Blue).fg(Color::White)
+                Style::default().bg(theme.selected_bg).fg(theme.selected_fg)
             } else {
-                Style::default()
+                Style::default().fg(theme.panel_fg).bg(theme.panel_bg)
             };
             let inner_width = area.width.saturating_sub(2) as usize;
             let fixed_without_name = 35usize;
@@ -428,7 +433,9 @@ fn render_panel(
         PanelBackend::Local => "LOCAL".to_string(),
         PanelBackend::Remote { connection_name } => format!("SCP {}", connection_name),
     };
-    let list = List::new(items).block(
+    let list = List::new(items)
+        .style(Style::default().fg(theme.panel_fg).bg(theme.panel_bg))
+        .block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
@@ -522,13 +529,13 @@ fn format_modified(time: std::time::SystemTime) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
-fn syntax_highlight_line(line: &str, extension: &str) -> Vec<Span<'static>> {
+fn syntax_highlight_line(line: &str, extension: &str, theme: &ThemeColors) -> Vec<Span<'static>> {
     if extension == "md" {
         if line.trim_start().starts_with('#') {
             return vec![Span::styled(
                 line.to_string(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )];
         }
@@ -619,7 +626,7 @@ fn syntax_highlight_line(line: &str, extension: &str) -> Vec<Span<'static>> {
                     break;
                 }
             }
-            spans.push(Span::styled(string, Style::default().fg(Color::Green)));
+            spans.push(Span::styled(string, Style::default().fg(theme.text_success)));
             continue;
         }
 
@@ -635,7 +642,7 @@ fn syntax_highlight_line(line: &str, extension: &str) -> Vec<Span<'static>> {
                     break;
                 }
             }
-            spans.push(Span::styled(number, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(number, Style::default().fg(theme.text_warning)));
             continue;
         }
 
@@ -652,7 +659,7 @@ fn syntax_highlight_line(line: &str, extension: &str) -> Vec<Span<'static>> {
             let token = &code_part[start..idx];
             if keywords.iter().any(|kw| *kw == token) {
                 flush_buffer(&mut spans, &mut buffer, Style::default());
-                spans.push(Span::styled(token.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(token.to_string(), Style::default().fg(theme.text_accent).add_modifier(Modifier::BOLD)));
             } else {
                 buffer.push_str(token);
             }
@@ -666,13 +673,13 @@ fn syntax_highlight_line(line: &str, extension: &str) -> Vec<Span<'static>> {
     flush_buffer(&mut spans, &mut buffer, Style::default());
 
     if let Some(comment) = comment_part {
-        spans.push(Span::styled(comment.to_string(), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)));
+        spans.push(Span::styled(comment.to_string(), Style::default().fg(theme.text_dim).add_modifier(Modifier::ITALIC)));
     }
 
     spans
 }
 
-fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) {
+fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, theme: &ThemeColors) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -685,7 +692,7 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) 
     let header = Paragraph::new(format!("Visor: {}", viewer.path.display()))
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.header_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
@@ -716,9 +723,9 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) 
             let mut spans = Vec::new();
             spans.push(Span::styled(
                 format!("{:>4} ", offset + index + 1),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_dim),
             ));
-            spans.extend(syntax_highlight_line(line, &extension));
+            spans.extend(syntax_highlight_line(line, &extension, theme));
             Line::from(spans)
         })
         .collect::<Vec<_>>();
@@ -732,7 +739,7 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str) 
         viewer.lines.len(),
         status_message
     ))
-    .style(Style::default().fg(Color::Cyan))
+    .style(Style::default().fg(theme.status_fg))
     .block(Block::default().borders(Borders::ALL).title("Estado"));
     frame.render_widget(footer, layout[2]);
 }
@@ -744,11 +751,11 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
 
     let area = centered_rect(frame.area(), 60, 20);
     let overlay = Paragraph::new(format!("{}\n\nEnter/Y confirmar, Esc/N cancelar", message))
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
+                .border_style(Style::default().fg(app.theme.text_error))
                 .title("Confirmacion"),
         )
         .wrap(Wrap { trim: true });
@@ -768,17 +775,17 @@ fn render_rename_input(frame: &mut Frame, app: &App) {
         Line::from(Span::raw(format!("Destino por defecto (Enter): {}", dialog.default_move_dir.display()))),
         Line::from(""),
         Line::from("Si hay un solo elemento, escriba para cambiar nombre en el directorio actual:"),
-        text_with_blinking_cursor(&dialog.input, app.marquee_tick),
+        text_with_blinking_cursor(&dialog.input, app.marquee_tick, &app.theme),
         Line::from(""),
         Line::from("Enter confirmar, Esc cancelar, Backspace borrar"),
     ]);
 
     let overlay = Paragraph::new(content)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightBlue))
+                .border_style(Style::default().fg(app.theme.text_accent))
                 .title("F6 Renombrar/Mover"),
         )
         .wrap(Wrap { trim: false });
@@ -796,17 +803,17 @@ fn render_search_input(frame: &mut Frame, app: &App) {
         Line::from(Span::raw(format!("Buscar en: {}", dialog.root_dir.display()))),
         Line::from(""),
         Line::from("Ingrese texto o patron (*.rs, foo*bar) y opcional type:<ext>:"),
-        text_with_blinking_cursor(&dialog.input, app.marquee_tick),
+        text_with_blinking_cursor(&dialog.input, app.marquee_tick, &app.theme),
         Line::from(""),
         Line::from("Enter para buscar, Esc cancelar, Backspace borrar"),
     ]);
 
     let overlay = Paragraph::new(content)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightMagenta))
+                .border_style(Style::default().fg(app.theme.text_warning))
                 .title("F2 Buscar archivos"),
         )
         .wrap(Wrap { trim: false });
@@ -814,7 +821,7 @@ fn render_search_input(frame: &mut Frame, app: &App) {
     frame.render_widget(overlay, area);
 }
 
-fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
+fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str, theme: &ThemeColors) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -828,7 +835,8 @@ fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
     let header = Paragraph::new(format!("Buscar: '{}' en {}", state.query, state.root_dir.display()))
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.header_fg)
+                .bg(theme.panel_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL).title("Busqueda"))
@@ -845,12 +853,12 @@ fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
                     "Progreso de busqueda"
                 }),
         )
-        .gauge_style(Style::default().fg(Color::Magenta).bg(Color::Black))
+        .gauge_style(Style::default().fg(theme.text_error).bg(theme.gauge_bg))
         .ratio(state.progress_fraction());
     frame.render_widget(progress, layout[1]);
 
     let items = if state.entries.is_empty() {
-        vec![ListItem::new("No se encontraron resultados").style(Style::default().fg(Color::Gray))]
+        vec![ListItem::new("No se encontraron resultados").style(Style::default().fg(theme.text_dim))]
     } else {
         state
             .entries
@@ -865,9 +873,9 @@ fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
                     "     "
                 };
                 let style = if index == state.selected {
-                    Style::default().bg(Color::Blue).fg(Color::White)
+                    Style::default().bg(theme.selected_bg).fg(theme.selected_fg)
                 } else {
-                    Style::default()
+                    Style::default().fg(theme.panel_fg).bg(theme.panel_bg)
                 };
                 ListItem::new(format!("{} {} - {}", marker, entry.name, entry.path.display()))
                     .style(style)
@@ -875,11 +883,13 @@ fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
             .collect()
     };
 
-    let body = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Resultados ({})", state.entries.len())),
-    );
+    let body = List::new(items)
+        .style(Style::default().fg(theme.panel_fg).bg(theme.panel_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Resultados ({})", state.entries.len())),
+        );
     frame.render_widget(body, layout[2]);
 
     let footer_text = if state.finished {
@@ -898,7 +908,7 @@ fn render_search(frame: &mut Frame, state: &SearchState, status_message: &str) {
     };
 
     let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(theme.status_fg).bg(theme.panel_bg))
         .block(Block::default().borders(Borders::ALL).title("Estado"));
     frame.render_widget(footer, layout[3]);
 }
@@ -941,11 +951,11 @@ fn render_help(frame: &mut Frame, app: &App) {
     .join("\n");
 
     let overlay = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(Style::default().fg(app.theme.header_fg))
                 .title("Ayuda"),
         )
         .wrap(Wrap { trim: false });
@@ -982,11 +992,11 @@ fn render_capibara(frame: &mut Frame, app: &App) {
     ]);
 
     let overlay = Paragraph::new(content)
-        .style(Style::default().fg(Color::LightYellow))
+        .style(Style::default().fg(app.theme.text_warning))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightMagenta))
+                .border_style(Style::default().fg(app.theme.text_error))
                 .title("Easter Egg"),
         )
         .wrap(Wrap { trim: false });

@@ -20,6 +20,7 @@ use crate::{
     config::{ConfigStore, SavedConnection},
     ops::{OverwriteBatchState, OverwriteOperation, apply_batch_operation, remove_path_recursive},
     remote::RemoteSession,
+    theme::ThemeColors,
     transfer::{CopyJob, TransferBackend, TransferEvent, spawn_copy_worker},
     viewer::ViewerState,
 };
@@ -417,6 +418,7 @@ pub struct App {
     pub config_store: ConfigStore,
     pub remote_sessions: HashMap<String, RemoteSession>,
     pub active_transfer: Option<TransferState>,
+    pub theme: ThemeColors,
 }
 
 pub struct TransferState {
@@ -432,7 +434,9 @@ impl App {
     pub fn new() -> Result<Self> {
         let cwd = std::env::current_dir().context("No se pudo obtener el directorio actual")?;
         let config_store = ConfigStore::new()?;
-        let saved_connections = config_store.load_connections().unwrap_or_default();
+        let config = config_store.load_config().unwrap_or_default();
+        let saved_connections = config.connections;
+        let theme = crate::theme::load_theme(&config.theme_name);
         Ok(Self {
             left: PanelState::new(cwd.clone())?,
             right: PanelState::new(cwd)?,
@@ -458,6 +462,7 @@ impl App {
             config_store,
             remote_sessions: HashMap::new(),
             active_transfer: None,
+            theme,
         })
     }
 

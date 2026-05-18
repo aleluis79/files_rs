@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod ops;
 mod remote;
+mod theme;
 mod transfer;
 mod ui;
 mod viewer;
