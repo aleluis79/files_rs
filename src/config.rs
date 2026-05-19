@@ -37,7 +37,21 @@ impl ConfigStore {
 
     pub fn load_config(&self) -> Result<AppConfigFile> {
         if !self.path.exists() {
-            return Ok(AppConfigFile::default());
+            // Create default config file if it doesn't exist
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("No se pudo crear {}", parent.display()))?;
+            }
+
+            let mut default_config = AppConfigFile::default();
+            default_config.theme_name = "dark".to_string();
+
+            let serialized = toml::to_string_pretty(&default_config)
+                .context("No se pudo serializar configuracion por defecto")?;
+            fs::write(&self.path, serialized)
+                .with_context(|| format!("No se pudo escribir {}", self.path.display()))?;
+
+            return Ok(default_config);
         }
 
         let content = fs::read_to_string(&self.path)
