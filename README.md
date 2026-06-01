@@ -52,6 +52,53 @@ Luego ejecuta el programa con:
 ncrs
 ```
 
+## Temas
+
+El archivo de configuración se guarda en `~/.config/files-rs/config.toml` y el valor `theme_name` ahora resuelve archivos TOML dentro de `~/.config/files-rs/themes/`.
+
+Al iniciar la aplicación se crean, si no existen, estos temas editables:
+
+- `~/.config/files-rs/themes/dark.toml`
+- `~/.config/files-rs/themes/light.toml`
+- `~/.config/files-rs/themes/solarized.toml`
+
+Ejemplo de configuración:
+
+```toml
+theme_name = "dark"
+```
+
+También puedes crear tu propio archivo en ese directorio y referenciarlo por nombre:
+
+```toml
+theme_name = "mi-tema"
+```
+
+Eso cargará `~/.config/files-rs/themes/mi-tema.toml`. Si prefieres, también puedes usar una ruta relativa dentro del directorio de temas o una ruta absoluta a un archivo TOML.
+
+Cada archivo de tema usa este formato:
+
+```toml
+header_fg = "yellow"
+border_active = "green"
+border_inactive = "darkgray"
+selected_bg = "blue"
+selected_fg = "white"
+panel_bg = "reset"
+panel_fg = "reset"
+text_normal = "white"
+text_dim = "gray"
+text_accent = "cyan"
+text_success = "green"
+text_warning = "yellow"
+text_error = "lightred"
+gauge_fill = "green"
+gauge_bg = "black"
+status_fg = "cyan"
+```
+
+Los colores aceptan nombres ANSI como `blue`, `darkgray` y `lightred`, colores RGB en formato `#RRGGBB` y colores indexados en formato `ansi(123)`.
+
 ## Dependencias
 
 | Crate | Uso |

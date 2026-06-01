@@ -85,4 +85,11 @@ impl ConfigStore {
     pub fn config_path(&self) -> &PathBuf {
         &self.path
     }
+
+    pub fn themes_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join("themes"))
+            .unwrap_or_else(|| PathBuf::from("themes"))
+    }
 }

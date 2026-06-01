@@ -436,7 +436,7 @@ impl App {
         let config_store = ConfigStore::new()?;
         let config = config_store.load_config().unwrap_or_default();
         let saved_connections = config.connections;
-        let theme = crate::theme::load_theme(&config.theme_name);
+        let theme = crate::theme::load_theme(&config.theme_name, &config_store.themes_dir());
         Ok(Self {
             left: PanelState::new(cwd.clone())?,
             right: PanelState::new(cwd)?,
