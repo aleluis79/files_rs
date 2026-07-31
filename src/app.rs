@@ -17,7 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use glob::Pattern;
 
 use crate::{
-    audio::{AudioPlaybackStatus, AudioPlayerState, is_supported_audio_path},
+    audio::{AudioPlaybackStatus, AudioPlayerState, is_supported_audio_path, linux_audio_dependency_warning},
     config::{ConfigStore, SavedConnection},
     ops::{OverwriteBatchState, OverwriteOperation, apply_batch_operation, remove_path_recursive},
     remote::RemoteSession,
@@ -479,6 +479,7 @@ impl App {
         fs::create_dir_all(&audio_cache_dir)
             .with_context(|| format!("No se pudo crear cache de audio en {}", audio_cache_dir.display()))?;
         let theme = crate::theme::load_theme(&config.theme_name, &config_store.themes_dir());
+        let status_message = linux_audio_dependency_warning().unwrap_or_else(|| "Listo".to_string());
         Ok(Self {
             left: PanelState::new(cwd.clone())?,
             right: PanelState::new(cwd)?,
@@ -501,7 +502,7 @@ impl App {
             confirmation: None,
             exit_dir: None,
             should_quit: false,
-            status_message: "Listo".to_string(),
+            status_message,
             pending_viewer_exit: false,
             config_store,
             remote_sessions: HashMap::new(),

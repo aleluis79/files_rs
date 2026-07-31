@@ -8,7 +8,13 @@ mod transfer;
 mod ui;
 mod viewer;
 
-use std::{fs, io, path::Path, time::Duration};
+use std::{
+    fs, io,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -18,7 +24,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::app::App;
+use crate::{app::App, audio::linux_audio_dependency_warning};
 
 fn main() -> Result<()> {
     suppress_alsa_stderr_noise();
@@ -27,6 +33,7 @@ fn main() -> Result<()> {
     restore_terminal(&mut terminal)?;
     let exit_dir = result?;
     handoff_exit_directory(&exit_dir)?;
+    handoff_audio_dependency_guidance();
     Ok(())
 }
 
@@ -97,6 +104,65 @@ fn handoff_exit_directory(exit_dir: &Path) -> Result<()> {
 fn shell_quote(path: &Path) -> String {
     let raw = path.display().to_string();
     format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+fn handoff_audio_dependency_guidance() {
+    let Some(warning) = linux_audio_dependency_warning() else {
+        return;
+    };
+
+    let install_command = "sudo apt install libasound2-plugins alsa-utils";
+    let description =
+        "Instala los paquetes necesarios para habilitar la reproduccion de audio (ALSA) en files_rs.";
+
+    println!();
+    println!("Aviso de audio: {warning}");
+    println!("Descripcion: {description}");
+    println!("Comando de instalacion: {install_command}");
+
+    if copy_to_clipboard(install_command) {
+        println!("Comando copiado al portapapeles.");
+    } else {
+        println!(
+            "No se pudo copiar automaticamente. Copia y ejecuta el comando de instalacion manualmente."
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn copy_to_clipboard(text: &str) -> bool {
+    copy_to_clipboard_with("wl-copy", &[], text)
+        || copy_to_clipboard_with("xclip", &["-selection", "clipboard"], text)
+        || copy_to_clipboard_with("xsel", &["--clipboard", "--input"], text)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_to_clipboard_with(command: &str, args: &[&str], text: &str) -> bool {
+    let mut child = match Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+
+    child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_to_clipboard(_text: &str) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]

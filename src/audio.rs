@@ -2,6 +2,7 @@ use std::{
     fs,
     fs::File,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -109,6 +110,7 @@ impl AudioPlayerState {
     }
 
     fn build_player() -> Result<(MixerDeviceSink, Player)> {
+        validate_linux_audio_dependencies()?;
         let mut sink = open_preferred_sink()
             .context("No se pudo abrir el dispositivo de audio por defecto")?;
         sink.log_on_drop(false);
@@ -279,6 +281,87 @@ impl AudioPlayerState {
             AudioPlaybackStatus::Stopped => "Detenido",
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_audio_dependencies() -> Result<()> {
+    if let Some(message) = linux_audio_dependency_warning() {
+        return Err(anyhow::anyhow!(message));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_linux_audio_dependencies() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_audio_dependency_warning() -> Option<String> {
+    let mut missing_packages = Vec::new();
+
+    if !command_succeeds("aplay", &["--version"]) {
+        missing_packages.push("alsa-utils");
+    }
+
+    if command_succeeds("dpkg-query", &["--version"]) {
+        for package in ["libasound2-plugins", "alsa-utils"] {
+            if !debian_package_installed(package) && !missing_packages.contains(&package) {
+                missing_packages.push(package);
+            }
+        }
+    } else {
+        let has_alsa_plugins = [
+            "/usr/lib/alsa-lib/libasound_module_pcm_pulse.so",
+            "/usr/lib64/alsa-lib/libasound_module_pcm_pulse.so",
+            "/usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
+            "/usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
+            "/usr/lib/arm-linux-gnueabihf/alsa-lib/libasound_module_pcm_pulse.so",
+        ]
+        .iter()
+        .any(|path| Path::new(path).exists());
+        if !has_alsa_plugins {
+            missing_packages.push("libasound2-plugins");
+        }
+    }
+
+    if missing_packages.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Audio no disponible: faltan paquetes ({}). Instala: sudo apt install libasound2-plugins alsa-utils",
+        missing_packages.join(", ")
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn linux_audio_dependency_warning() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn command_succeeds(command: &str, args: &[&str]) -> bool {
+    Command::new(command)
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn debian_package_installed(package: &str) -> bool {
+    Command::new("dpkg-query")
+        .args(["-W", "-f=${Status}", package])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .contains("install ok installed")
+        })
+        .unwrap_or(false)
 }
 
 fn read_song_metadata(path: &Path) -> SongMetadata {
