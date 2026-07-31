@@ -5,26 +5,49 @@ Administrador de archivos de doble panel estilo Norton Commander, escrito en Rus
 ## Características
 
 - **Doble panel** — navegación independiente en dos directorios simultáneamente
-- **Visor de texto** — visualización de archivos con scroll (`F3`)
+- **Visor de texto** — visualización con scroll vertical y horizontal (`F3`)
+- **Editor integrado** — edición directa en TUI (`F4`) con cursor, selección, copiar/pegar y deshacer
 - **Selección múltiple** — marca archivos con `Espacio` para operar sobre varios a la vez
 - **Operaciones de archivo** — copiar, mover/renombrar, crear directorio y eliminar
 - **Integración con shell** — cambia el directorio de la terminal al salir de la aplicación
 
 ## Teclas
 
+### Paneles
+
 | Tecla | Acción |
 |-------|--------|
 | `↑` / `↓` | Mover cursor |
 | `Enter` | Entrar en directorio / abrir archivo |
 | `Tab` | Cambiar de panel activo |
+| `H` | Alternar archivos ocultos |
 | `Espacio` | Marcar / desmarcar archivo |
 | `F3` | Ver archivo |
+| `F4` | Editar archivo |
 | `F5` | Copiar |
 | `F6` | Mover / Renombrar |
 | `F7` | Crear directorio |
 | `F8` | Eliminar |
+| `F9` / `Shift+F9` | Cambiar orden y dirección |
+| `F12` / `Shift+F12` | Conectar / desconectar SCP |
 | `F10` | Salir |
 | `Esc` | Cancelar operación / cerrar visor |
+
+### Visor/Editor (`F3`/`F4`)
+
+| Tecla | Acción |
+|-------|--------|
+| `F4` | Entrar en modo edición |
+| `F3` / `Esc` | Salir del visor/editor (con guardar/descartar si hay cambios) |
+| `↑` / `↓` / `←` / `→` | Mover cursor en edición |
+| `PageUp` / `PageDown` | Desplazamiento rápido vertical |
+| `Home` / `End` | Ir al inicio/fin de línea |
+| `Shift + flechas` | Seleccionar texto |
+| `Ctrl+C` | Copiar selección |
+| `Ctrl+V` | Pegar |
+| `Ctrl+Z` | Deshacer |
+| `Enter` | Nueva línea |
+| `Backspace` / `Delete` | Borrar carácter o selección |
 
 ## Instalación
 
