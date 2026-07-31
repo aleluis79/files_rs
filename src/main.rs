@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod config;
 mod ops;
 mod remote;
@@ -58,6 +59,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<std:
         app.advance_marquee();
         app.advance_search()?;
         app.advance_transfer()?;
+        app.advance_audio_cache()?;
+        app.advance_audio()?;
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 

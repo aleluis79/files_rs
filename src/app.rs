@@ -1,7 +1,8 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs, io,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use glob::Pattern;
 
 use crate::{
+    audio::{AudioPlaybackStatus, AudioPlayerState, is_supported_audio_path},
     config::{ConfigStore, SavedConnection},
     ops::{OverwriteBatchState, OverwriteOperation, apply_batch_operation, remove_path_recursive},
     remote::RemoteSession,
@@ -28,6 +30,7 @@ use crate::{
 pub enum AppMode {
     Panels,
     Viewer(ViewerState),
+    AudioPlayer,
     Search(SearchState),
 }
 
@@ -419,6 +422,10 @@ pub struct App {
     pub config_store: ConfigStore,
     pub remote_sessions: HashMap<String, RemoteSession>,
     pub active_transfer: Option<TransferState>,
+    pub active_audio_cache: Option<RemoteAudioCacheState>,
+    pub background_audio: Option<AudioPlayerState>,
+    pub background_audio_folder_key: Option<String>,
+    pub audio_cache_dir: PathBuf,
     pub theme: ThemeColors,
 }
 
@@ -431,12 +438,45 @@ pub struct TransferState {
     pub total_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteAudioOpenMode {
+    Single,
+    Playlist,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteAudioCacheItem {
+    pub remote_path: PathBuf,
+    pub label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteAudioCacheState {
+    pub connection_name: String,
+    pub folder_key: String,
+    pub selected_label: String,
+    pub selected_remote_path: PathBuf,
+    pub open_mode: RemoteAudioOpenMode,
+    pub cache_dir: PathBuf,
+    pub pending_items: VecDeque<RemoteAudioCacheItem>,
+    pub total_items: usize,
+    pub cached_items: usize,
+    pub selected_local_path: Option<PathBuf>,
+}
+
 impl App {
     pub fn new() -> Result<Self> {
         let cwd = std::env::current_dir().context("No se pudo obtener el directorio actual")?;
         let config_store = ConfigStore::new()?;
         let config = config_store.load_config().unwrap_or_default();
         let saved_connections = config.connections;
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let audio_cache_dir = std::env::temp_dir().join(format!("files-rs-audio-cache-{unique}"));
+        fs::create_dir_all(&audio_cache_dir)
+            .with_context(|| format!("No se pudo crear cache de audio en {}", audio_cache_dir.display()))?;
         let theme = crate::theme::load_theme(&config.theme_name, &config_store.themes_dir());
         Ok(Self {
             left: PanelState::new(cwd.clone())?,
@@ -464,6 +504,10 @@ impl App {
             config_store,
             remote_sessions: HashMap::new(),
             active_transfer: None,
+            active_audio_cache: None,
+            background_audio: None,
+            background_audio_folder_key: None,
+            audio_cache_dir,
             theme,
         })
     }
@@ -582,6 +626,138 @@ impl App {
         Ok(())
     }
 
+    fn cleanup_audio_cache(&mut self) {
+        if self.audio_cache_dir.exists() {
+            let _ = fs::remove_dir_all(&self.audio_cache_dir);
+        }
+    }
+
+    fn folder_key_for_local_path(path: &Path) -> String {
+        let parent = path.parent().unwrap_or(Path::new(""));
+        format!("local:{}", parent.display())
+    }
+
+    fn folder_key_for_remote_path(connection_name: &str, path: &Path) -> String {
+        let parent = path.parent().unwrap_or(Path::new(""));
+        format!("remote:{}:{}", connection_name, parent.display())
+    }
+
+    fn cache_file_name_for_remote(connection_name: &str, remote_path: &Path) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        connection_name.hash(&mut hasher);
+        remote_path.to_string_lossy().hash(&mut hasher);
+        let hash = hasher.finish();
+        let file_name = remote_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio.bin");
+        format!("{:016x}-{}", hash, file_name)
+    }
+
+    fn cancel_audio_cache(&mut self) {
+        if let Some(state) = self.active_audio_cache.take() {
+            if state.open_mode == RemoteAudioOpenMode::Playlist && state.cache_dir.exists() {
+                let _ = fs::remove_dir_all(&state.cache_dir);
+            }
+            self.status_message = "Cache de audio remoto cancelado".to_string();
+        }
+    }
+
+    pub fn advance_audio_cache(&mut self) -> Result<()> {
+        let Some(mut state) = self.active_audio_cache.take() else {
+            return Ok(());
+        };
+
+        let Some(next_item) = state.pending_items.pop_front() else {
+            self.status_message = "No hay elementos pendientes en cache remoto".to_string();
+            return Ok(());
+        };
+
+        let session = match self.remote_session_for(&state.connection_name) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status_message = format!("Sesion remota no disponible: {error}");
+                return Ok(());
+            }
+        };
+        let bytes = match session.read_file_bytes(&next_item.remote_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status_message = format!(
+                    "No se pudo descargar {} desde {}: {error}",
+                    next_item.label, state.connection_name
+                );
+                return Ok(());
+            }
+        };
+
+        let local_name = Self::cache_file_name_for_remote(&state.connection_name, &next_item.remote_path);
+        let local_path = state.cache_dir.join(local_name);
+        if let Err(error) = fs::write(&local_path, bytes) {
+            self.status_message = format!("No se pudo guardar cache de {}: {error}", next_item.label);
+            return Ok(());
+        }
+
+        state.cached_items = state.cached_items.saturating_add(1);
+        if next_item.remote_path == state.selected_remote_path {
+            state.selected_local_path = Some(local_path.clone());
+        }
+
+        if state.pending_items.is_empty() {
+            let Some(selected_local_path) = state.selected_local_path.clone() else {
+                self.status_message =
+                    "No se encontro el archivo seleccionado al completar cache remoto".to_string();
+                return Ok(());
+            };
+
+            match state.open_mode {
+                RemoteAudioOpenMode::Single => {
+                    self.open_audio_player_for_path(
+                        &selected_local_path,
+                        &state.selected_label,
+                        state.folder_key,
+                    );
+                }
+                RemoteAudioOpenMode::Playlist => {
+                    self.open_audio_playlist_for_path(
+                        &selected_local_path,
+                        &state.selected_label,
+                        state.folder_key,
+                    );
+                }
+            }
+
+            return Ok(());
+        }
+
+        self.status_message = format!(
+            "Cacheando audio remoto {}/{}...",
+            state.cached_items, state.total_items
+        );
+        self.active_audio_cache = Some(state);
+        Ok(())
+    }
+
+    pub fn advance_audio(&mut self) -> Result<()> {
+        if let Some(player) = &mut self.background_audio {
+            if player.should_advance_track() {
+                let advanced = player.advance_finished_track()?;
+                if advanced {
+                    self.status_message = format!(
+                        "Reproduciendo: {} ({}/{})",
+                        player.current_track_name(),
+                        player.current_track_number(),
+                        player.total_tracks()
+                    );
+                } else {
+                    self.status_message = "Playlist finalizada".to_string();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if self.mkdir_input.is_some() {
             return self.handle_mkdir_input_key(key);
@@ -625,8 +801,21 @@ impl App {
             return Ok(());
         }
 
+        if self.active_audio_cache.is_some() {
+            if key.code == KeyCode::Esc {
+                self.cancel_audio_cache();
+            } else {
+                self.status_message = "Cacheando audio remoto... (Esc para cancelar)".to_string();
+            }
+            return Ok(());
+        }
+
         if matches!(self.mode, AppMode::Viewer(_)) {
             return self.handle_viewer_key(key);
+        }
+
+        if matches!(self.mode, AppMode::AudioPlayer) {
+            return self.handle_audio_player_key(key);
         }
 
         if matches!(self.mode, AppMode::Search(_)) {
@@ -660,6 +849,7 @@ impl App {
             KeyCode::Char(' ') => self.active_panel_mut().toggle_mark(),
             KeyCode::F(3) => self.preview_selected(),
             KeyCode::F(4) => self.edit_selected(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.play_selected_audio(),
             KeyCode::F(5) => {
                 if self.active_transfer.is_some() {
                     self.status_message = "Espera a que termine la transferencia actual".to_string();
@@ -737,12 +927,20 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, left_panel_width: u16) {
+        if self.active_audio_cache.is_some() {
+            return;
+        }
+
         if let AppMode::Viewer(viewer) = &mut self.mode {
             match mouse.kind {
                 MouseEventKind::ScrollDown => viewer.scroll_down(),
                 MouseEventKind::ScrollUp => viewer.scroll_up(),
                 _ => {}
             }
+            return;
+        }
+
+        if matches!(self.mode, AppMode::AudioPlayer) {
             return;
         }
 
@@ -838,6 +1036,12 @@ impl App {
         if self.active_transfer.is_some() {
             self.status_message =
                 "No se puede desconectar SCP durante una transferencia activa".to_string();
+            return Ok(());
+        }
+
+        if self.active_audio_cache.is_some() {
+            self.status_message =
+                "No se puede desconectar SCP mientras se cachea audio remoto".to_string();
             return Ok(());
         }
 
@@ -1458,6 +1662,7 @@ impl App {
             KeyCode::Enter => self.open_search_selected()?,
             KeyCode::F(3) => self.open_search_selected_preview(),
             KeyCode::F(4) => self.open_search_selected_edit(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.open_search_selected_audio(),
             KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
             _ => {}
         }
@@ -1534,6 +1739,9 @@ impl App {
     }
 
     fn open_search_selected_preview(&mut self) {
+        if self.open_search_selected_audio_if_supported() {
+            return;
+        }
         self.open_search_selected_viewer(false);
     }
 
@@ -1578,7 +1786,439 @@ impl App {
     }
 
     fn preview_selected(&mut self) {
+        if self.open_selected_audio_if_supported() {
+            return;
+        }
         self.open_selected_viewer(false);
+    }
+
+    fn open_search_selected_audio_if_supported(&mut self) -> bool {
+        let path_and_name = if let AppMode::Search(state) = &self.mode {
+            state
+                .entries
+                .get(state.selected)
+                .map(|entry| (entry.path.clone(), entry.name.clone()))
+        } else {
+            None
+        };
+
+        let Some((path, name)) = path_and_name else {
+            return false;
+        };
+
+        if !is_supported_audio_path(&path) {
+            return false;
+        }
+
+        let folder_key = Self::folder_key_for_local_path(&path);
+        self.open_audio_player_for_path(&path, &name, folder_key);
+        true
+    }
+
+    fn open_selected_audio_if_supported(&mut self) -> bool {
+        let backend = self.active_panel().backend.clone();
+        let selected = self
+            .active_panel()
+            .selected_entry()
+            .map(|entry| (entry.path.clone(), entry.name.clone(), entry.is_dir));
+
+        let Some((path, name, is_dir)) = selected else {
+            return false;
+        };
+
+        if is_dir || !is_supported_audio_path(&path) {
+            return false;
+        }
+
+        match backend {
+            PanelBackend::Local => {
+                let folder_key = Self::folder_key_for_local_path(&path);
+                self.open_audio_player_for_path(&path, &name, folder_key);
+                true
+            }
+            PanelBackend::Remote { connection_name } => {
+                self.open_remote_audio_player_for_path(&connection_name, &path, &name);
+                true
+            }
+        }
+    }
+
+    fn open_search_selected_audio(&mut self) {
+        if self.open_search_selected_playlist_if_supported() {
+            return;
+        }
+
+        self.status_message = "Selecciona un archivo de audio compatible para reproducir".to_string();
+    }
+
+    fn play_selected_audio(&mut self) {
+        if self.open_selected_playlist_if_supported() {
+            return;
+        }
+
+        if self.background_audio.is_some() {
+            self.mode = AppMode::AudioPlayer;
+            self.status_message = "Volviendo al reproductor".to_string();
+            return;
+        }
+
+        self.status_message = "Selecciona un archivo de audio compatible para reproducir".to_string();
+    }
+
+    fn open_search_selected_playlist_if_supported(&mut self) -> bool {
+        let path_and_name = if let AppMode::Search(state) = &self.mode {
+            state
+                .entries
+                .get(state.selected)
+                .map(|entry| (entry.path.clone(), entry.name.clone()))
+        } else {
+            None
+        };
+
+        let Some((path, name)) = path_and_name else {
+            return false;
+        };
+
+        if !is_supported_audio_path(&path) {
+            return false;
+        }
+
+        let folder_key = Self::folder_key_for_local_path(&path);
+        if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str()) {
+            self.mode = AppMode::AudioPlayer;
+            self.status_message = "Reproductor reabierto (misma playlist)".to_string();
+            return true;
+        }
+
+        self.open_audio_playlist_for_path(&path, &name, folder_key);
+        true
+    }
+
+    fn open_selected_playlist_if_supported(&mut self) -> bool {
+        let backend = self.active_panel().backend.clone();
+        let selected = self
+            .active_panel()
+            .selected_entry()
+            .map(|entry| (entry.path.clone(), entry.name.clone(), entry.is_dir));
+
+        let Some((path, name, is_dir)) = selected else {
+            return false;
+        };
+
+        if is_dir || !is_supported_audio_path(&path) {
+            return false;
+        }
+
+        match backend {
+            PanelBackend::Local => {
+                let folder_key = Self::folder_key_for_local_path(&path);
+                if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str()) {
+                    self.mode = AppMode::AudioPlayer;
+                    self.status_message = "Reproductor reabierto (misma playlist)".to_string();
+                    return true;
+                }
+                self.open_audio_playlist_for_path(&path, &name, folder_key);
+                true
+            }
+            PanelBackend::Remote { connection_name } => {
+                let folder_key = Self::folder_key_for_remote_path(&connection_name, &path);
+                if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str()) {
+                    self.mode = AppMode::AudioPlayer;
+                    self.status_message = "Reproductor reabierto (misma playlist)".to_string();
+                    return true;
+                }
+                self.open_remote_audio_playlist_for_path(&connection_name, &path, &name, folder_key);
+                true
+            }
+        }
+    }
+
+    fn make_remote_playlist_cache_dir(&self, folder_key: &str) -> Result<PathBuf> {
+        let mut folder_hasher = std::collections::hash_map::DefaultHasher::new();
+        folder_key.hash(&mut folder_hasher);
+        let playlist_hash = folder_hasher.finish();
+        let playlist_cache_dir = self
+            .audio_cache_dir
+            .join(format!("remote-playlist-{:016x}", playlist_hash));
+
+        if playlist_cache_dir.exists() {
+            fs::remove_dir_all(&playlist_cache_dir).with_context(|| {
+                format!(
+                    "No se pudo limpiar cache temporal de playlist remota {}",
+                    playlist_cache_dir.display()
+                )
+            })?;
+        }
+
+        fs::create_dir_all(&playlist_cache_dir).with_context(|| {
+            format!(
+                "No se pudo crear cache temporal de playlist remota {}",
+                playlist_cache_dir.display()
+            )
+        })?;
+
+        Ok(playlist_cache_dir)
+    }
+
+    fn begin_remote_audio_cache(
+        &mut self,
+        connection_name: &str,
+        selected_path: &Path,
+        selected_label: &str,
+        folder_key: String,
+        open_mode: RemoteAudioOpenMode,
+        pending_items: VecDeque<RemoteAudioCacheItem>,
+        cache_dir: PathBuf,
+    ) {
+        let total_items = pending_items.len();
+        self.active_audio_cache = Some(RemoteAudioCacheState {
+            connection_name: connection_name.to_string(),
+            folder_key,
+            selected_label: selected_label.to_string(),
+            selected_remote_path: selected_path.to_path_buf(),
+            open_mode,
+            cache_dir,
+            pending_items,
+            total_items,
+            cached_items: 0,
+            selected_local_path: None,
+        });
+        self.status_message = format!("Cacheando audio remoto 0/{}...", total_items);
+    }
+
+    fn queue_single_remote_audio_for_cache(
+        &mut self,
+        connection_name: &str,
+        remote_path: &Path,
+        label: &str,
+    ) {
+        let mut pending_items = VecDeque::new();
+        pending_items.push_back(RemoteAudioCacheItem {
+            remote_path: remote_path.to_path_buf(),
+            label: label.to_string(),
+        });
+
+        let folder_key = Self::folder_key_for_remote_path(connection_name, remote_path);
+        self.begin_remote_audio_cache(
+            connection_name,
+            remote_path,
+            label,
+            folder_key,
+            RemoteAudioOpenMode::Single,
+            pending_items,
+            self.audio_cache_dir.clone(),
+        );
+    }
+
+    fn queue_remote_playlist_for_cache(
+        &mut self,
+        connection_name: &str,
+        selected_path: &Path,
+        selected_label: &str,
+        folder_key: String,
+    ) -> Result<()> {
+        let session = self.remote_session_for(connection_name)?;
+        let parent = selected_path.parent().unwrap_or(Path::new("/"));
+        let entries = session.list_dir(parent, SortMode::Name, SortOrder::Ascending, true)?;
+
+        let mut pending_items = VecDeque::new();
+        for entry in entries {
+            if entry.is_dir || !is_supported_audio_path(&entry.path) {
+                continue;
+            }
+            pending_items.push_back(RemoteAudioCacheItem {
+                remote_path: entry.path,
+                label: entry.name,
+            });
+        }
+
+        if pending_items.is_empty() {
+            self.status_message = "No hay archivos de audio en la carpeta remota".to_string();
+            return Ok(());
+        }
+
+        let cache_dir = self.make_remote_playlist_cache_dir(&folder_key)?;
+        self.begin_remote_audio_cache(
+            connection_name,
+            selected_path,
+            selected_label,
+            folder_key,
+            RemoteAudioOpenMode::Playlist,
+            pending_items,
+            cache_dir,
+        );
+        Ok(())
+    }
+
+    fn open_remote_audio_player_for_path(&mut self, connection_name: &str, remote_path: &Path, label: &str) {
+        if self.active_audio_cache.is_some() {
+            self.status_message = "Ya hay un cacheo de audio remoto en curso".to_string();
+            return;
+        }
+
+        self.queue_single_remote_audio_for_cache(connection_name, remote_path, label);
+    }
+
+    fn open_remote_audio_playlist_for_path(
+        &mut self,
+        connection_name: &str,
+        selected_path: &Path,
+        label: &str,
+        folder_key: String,
+    ) {
+        if self.active_audio_cache.is_some() {
+            self.status_message = "Ya hay un cacheo de audio remoto en curso".to_string();
+            return;
+        }
+
+        if let Err(error) =
+            self.queue_remote_playlist_for_cache(connection_name, selected_path, label, folder_key)
+        {
+            self.status_message = format!("No se puede preparar playlist remota: {error}");
+        }
+    }
+
+    fn open_audio_player_for_path(&mut self, path: &Path, label: &str, folder_key: String) {
+        match AudioPlayerState::open(path) {
+            Ok(player) => {
+                self.background_audio = Some(player);
+                self.background_audio_folder_key = Some(folder_key);
+                self.mode = AppMode::AudioPlayer;
+                self.status_message = format!("Reproduciendo: {}", label);
+            }
+            Err(error) => {
+                self.status_message = format!("No se puede reproducir {}: {error}", label);
+            }
+        }
+    }
+
+    fn open_audio_playlist_for_path(&mut self, path: &Path, label: &str, folder_key: String) {
+        match AudioPlayerState::open_playlist_from_directory(path) {
+            Ok(player) => {
+                let total = player.total_tracks();
+                self.background_audio = Some(player);
+                self.background_audio_folder_key = Some(folder_key);
+                self.mode = AppMode::AudioPlayer;
+                self.status_message = format!("Playlist iniciada ({total} temas): {label}");
+            }
+            Err(error) => {
+                self.status_message = format!("No se puede abrir playlist para {}: {error}", label);
+            }
+        }
+    }
+
+    fn handle_audio_player_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::F(1) => {
+                self.show_help = true;
+            }
+            KeyCode::Esc | KeyCode::F(3) => {
+                self.mode = AppMode::Panels;
+                self.status_message = "Reproductor en segundo plano".to_string();
+            }
+            KeyCode::Char(' ') => {
+                if let Some(player) = &mut self.background_audio {
+                    match player.toggle_pause() {
+                        AudioPlaybackStatus::Playing => {
+                            self.status_message = "Reproduccion reanudada".to_string();
+                        }
+                        AudioPlaybackStatus::Paused => {
+                            self.status_message = "Reproduccion pausada".to_string();
+                        }
+                        AudioPlaybackStatus::Stopped => {
+                            self.status_message = "La reproduccion esta detenida. Usa R para reiniciar".to_string();
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if let Some(player) = &mut self.background_audio {
+                    player.stop();
+                    self.status_message = "Reproduccion detenida".to_string();
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(player) = &mut self.background_audio {
+                    match player.restart_current() {
+                        Ok(()) => {
+                            self.status_message = format!(
+                                "Reiniciado: {}",
+                                player.current_track_name()
+                            );
+                        }
+                        Err(error) => {
+                            self.status_message = format!("No se pudo reiniciar: {error}");
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                if let Some(player) = &mut self.background_audio {
+                    if player.toggle_loop() {
+                        self.status_message = "Loop de playlist activado".to_string();
+                    } else {
+                        self.status_message = "Loop de playlist desactivado".to_string();
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(player) = &mut self.background_audio {
+                    match player.next_track() {
+                        Ok(true) => {
+                            self.status_message = format!(
+                                "Siguiente: {}",
+                                player.current_track_name()
+                            );
+                        }
+                        Ok(false) => {
+                            self.status_message = "Ya estas en el ultimo tema (activa loop con L para volver al primero)".to_string();
+                        }
+                        Err(error) => {
+                            self.status_message = format!("No se pudo avanzar: {error}");
+                        }
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P') => {
+                if let Some(player) = &mut self.background_audio {
+                    match player.previous_track() {
+                        Ok(true) => {
+                            self.status_message = format!(
+                                "Anterior: {}",
+                                player.current_track_name()
+                            );
+                        }
+                        Ok(false) => {
+                            self.status_message = "Ya estas en el primer tema".to_string();
+                        }
+                        Err(error) => {
+                            self.status_message = format!("No se pudo retroceder: {error}");
+                        }
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(player) = &mut self.background_audio {
+                    if let Err(error) = player.seek_by_seconds(10) {
+                        self.status_message = format!("No se pudo adelantar: {error}");
+                    } else {
+                        self.status_message = "Adelantado +10s".to_string();
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(player) = &mut self.background_audio {
+                    if let Err(error) = player.seek_by_seconds(-10) {
+                        self.status_message = format!("No se pudo retroceder: {error}");
+                    } else {
+                        self.status_message = "Retrocedido -10s".to_string();
+                    }
+                }
+            }
+            KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
+            _ => {}
+        }
+        Ok(())
     }
 
     fn edit_selected(&mut self) {
@@ -2098,6 +2738,7 @@ impl App {
 
         match dialog.action {
             PendingAction::Quit => {
+                self.cleanup_audio_cache();
                 self.exit_dir = Some(self.compute_exit_directory());
                 self.should_quit = true;
             }

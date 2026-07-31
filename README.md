@@ -7,6 +7,10 @@ Administrador de archivos de doble panel estilo Norton Commander, escrito en Rus
 - **Doble panel** — navegación independiente en dos directorios simultáneamente
 - **Visor de texto** — visualización con scroll vertical y horizontal (`F3`)
 - **Editor integrado** — edición directa en TUI (`F4`) con cursor, selección, copiar/pegar y deshacer
+- **Reproductor de audio** — `F3` reproduce el archivo seleccionado; `M` abre una playlist con todos los audios de la carpeta (`mp3`, `wav`, `flac`, `ogg`, `m4a`, `aac`, `opus`)
+- **Audio por SCP** — en panel remoto, `F3` y `M` descargan temporalmente a cache local para reproducir, mostrando overlay animado de progreso (Esc cancela)
+- **Espectro visual animado** — visualización en tiempo real del tema en reproducción dentro del reproductor
+- **Metadata de canción** — muestra título, artista, álbum y género del tema en reproducción cuando está disponible
 - **Selección múltiple** — marca archivos con `Espacio` para operar sobre varios a la vez
 - **Operaciones de archivo** — copiar, mover/renombrar, crear directorio y eliminar
 - **Integración con shell** — cambia el directorio de la terminal al salir de la aplicación
@@ -22,8 +26,9 @@ Administrador de archivos de doble panel estilo Norton Commander, escrito en Rus
 | `Tab` | Cambiar de panel activo |
 | `H` | Alternar archivos ocultos |
 | `Espacio` | Marcar / desmarcar archivo |
-| `F3` | Ver archivo |
+| `F3` | Ver archivo (si es audio: reproducir archivo actual) |
 | `F4` | Editar archivo |
+| `M` | Abrir playlist de audio de la carpeta del archivo seleccionado |
 | `F5` | Copiar |
 | `F6` | Mover / Renombrar |
 | `F7` | Crear directorio |
@@ -48,6 +53,25 @@ Administrador de archivos de doble panel estilo Norton Commander, escrito en Rus
 | `Ctrl+Z` | Deshacer |
 | `Enter` | Nueva línea |
 | `Backspace` / `Delete` | Borrar carácter o selección |
+
+### Reproductor de audio (`M`)
+
+| Tecla | Acción |
+|-------|--------|
+| `Espacio` | Pausar / Reanudar |
+| `S` | Detener reproducción |
+| `R` | Reiniciar reproducción del archivo |
+| `N` / `P` | Siguiente / Anterior canción |
+| `→` / `←` | Adelantar / retroceder 10 segundos |
+| `L` | Activar / desactivar loop de playlist |
+| `F3` / `Esc` | Cerrar reproductor y volver a paneles |
+
+Notas:
+
+- Con `M`, la playlist se arma con todos los archivos de audio de la carpeta del archivo seleccionado.
+- Al salir del reproductor (`Esc`/`F3`), el audio sigue sonando en segundo plano.
+- Si presionas `M` en la misma carpeta, reabre el reproductor y continúa; en otra carpeta con audio, carga una playlist nueva.
+- El loop puede estar activado o desactivado con `L` durante la reproducción.
 
 ## Instalación
 

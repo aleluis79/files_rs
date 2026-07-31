@@ -37,6 +37,23 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_remote_connection_input(frame, app);
         render_confirmation(frame, app);
         render_transfer_overlay(frame, app);
+        render_audio_cache_overlay(frame, app);
+        render_help(frame, app);
+        render_capibara(frame, app);
+        return;
+    }
+
+    if let AppMode::AudioPlayer = &app.mode {
+        if let Some(player) = &app.background_audio {
+            render_audio_player(frame, player, &app.status_message, &app.theme, app.marquee_tick);
+        }
+        render_mkdir_input(frame, app);
+        render_rename_input(frame, app);
+        render_search_input(frame, app);
+        render_remote_connection_input(frame, app);
+        render_confirmation(frame, app);
+        render_transfer_overlay(frame, app);
+        render_audio_cache_overlay(frame, app);
         render_help(frame, app);
         render_capibara(frame, app);
         return;
@@ -50,6 +67,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_remote_connection_input(frame, app);
         render_confirmation(frame, app);
         render_transfer_overlay(frame, app);
+        render_audio_cache_overlay(frame, app);
         render_help(frame, app);
         render_capibara(frame, app);
         return;
@@ -105,7 +123,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar H Ocultos Esc Cancela copia F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F4 Editar M Playlist F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar H Ocultos Esc Cancela copia F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -123,6 +141,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_remote_connection_input(frame, app);
     render_confirmation(frame, app);
     render_transfer_overlay(frame, app);
+    render_audio_cache_overlay(frame, app);
     render_help(frame, app);
     render_capibara(frame, app);
 }
@@ -185,6 +204,72 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(app.theme.text_error).bg(app.theme.panel_bg))
         .block(Block::default().borders(Borders::ALL).title("Control"));
     frame.render_widget(hint, gauge_area[3]);
+}
+
+fn render_audio_cache_overlay(frame: &mut Frame, app: &App) {
+    let Some(cache) = &app.active_audio_cache else {
+        return;
+    };
+
+    let area = centered_rect(frame.area(), 64, 30);
+    let ratio = if cache.total_items == 0 {
+        0.0
+    } else {
+        (cache.cached_items as f64 / cache.total_items as f64).clamp(0.0, 1.0)
+    };
+    let spinner_frames = ["|", "/", "-", "\\"];
+    let spinner = spinner_frames[(app.marquee_tick as usize) % spinner_frames.len()];
+
+    let overlay = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area);
+
+    frame.render_widget(Clear, area);
+
+    let title = Paragraph::new(format!(
+        "{} Cacheando audio remoto",
+        spinner
+    ))
+    .style(
+        Style::default()
+            .fg(app.theme.header_fg)
+            .bg(app.theme.panel_bg)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.text_accent))
+            .title("SCP Audio"),
+    )
+    .centered();
+    frame.render_widget(title, overlay[0]);
+
+    let progress = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Progreso"))
+        .gauge_style(Style::default().fg(app.theme.gauge_fill).bg(app.theme.gauge_bg))
+        .ratio(ratio)
+        .label(format!("{}/{}", cache.cached_items, cache.total_items));
+    frame.render_widget(progress, overlay[1]);
+
+    let info = Paragraph::new(format!(
+        "Archivo seleccionado: {}",
+        cache.selected_label
+    ))
+    .style(Style::default().fg(app.theme.text_normal).bg(app.theme.panel_bg))
+    .block(Block::default().borders(Borders::ALL).title("Detalle"));
+    frame.render_widget(info, overlay[2]);
+
+    let hint = Paragraph::new("Esc para cancelar")
+        .style(Style::default().fg(app.theme.text_error).bg(app.theme.panel_bg))
+        .block(Block::default().borders(Borders::ALL).title("Control"));
+    frame.render_widget(hint, overlay[3]);
 }
 
 fn render_remote_connection_input(frame: &mut Frame, app: &App) {
@@ -943,6 +1028,183 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, 
     frame.render_widget(footer, layout[2]);
 }
 
+fn render_audio_player(
+    frame: &mut Frame,
+    player: &crate::audio::AudioPlayerState,
+    status_message: &str,
+    theme: &ThemeColors,
+    tick: u64,
+) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let header = Paragraph::new(format!("Reproductor: {}", player.path.display()))
+        .style(
+            Style::default()
+                .fg(theme.header_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Espacio pausar/reanudar | S detener | R reiniciar | ↑/↓ o N/P siguiente/anterior | ←/→ seek | L loop on/off | Esc/F3 volver"),
+        );
+    frame.render_widget(header, layout[0]);
+
+    let body_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(layout[1]);
+
+    let elapsed = player.position();
+    let elapsed_text = format!(
+        "{:02}:{:02}",
+        elapsed.as_secs() / 60,
+        elapsed.as_secs() % 60
+    );
+    let total_text = player
+        .total_duration()
+        .map(|total| format!("{:02}:{:02}", total.as_secs() / 60, total.as_secs() % 60))
+        .unwrap_or_else(|| "--:--".to_string());
+    let metadata = player.metadata();
+    let title = metadata
+        .title
+        .as_deref()
+        .unwrap_or("(sin titulo)");
+    let artist = metadata
+        .artist
+        .as_deref()
+        .unwrap_or("(sin artista)");
+    let album = metadata
+        .album
+        .as_deref()
+        .unwrap_or("(sin album)");
+    let genre = metadata
+        .genre
+        .as_deref()
+        .unwrap_or("(sin genero)");
+    let spectrum = build_spectrum_line(
+        44,
+        player.position().as_secs_f64() + tick as f64 * 0.03,
+        player.status_label() == "Reproduciendo",
+        player.current_track_number(),
+    );
+
+    let body_text = Text::from(vec![
+        Line::from(vec![
+            Span::styled("Estado: ", Style::default().fg(theme.text_dim)),
+            Span::styled(player.status_label(), Style::default().fg(theme.text_accent).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("Tema: ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                format!("{} / {}", player.current_track_number(), player.total_tracks()),
+                Style::default().fg(theme.text_normal),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Archivo: ", Style::default().fg(theme.text_dim)),
+            Span::styled(player.current_track_name(), Style::default().fg(theme.text_normal)),
+        ]),
+        Line::from(vec![
+            Span::styled("Titulo: ", Style::default().fg(theme.text_dim)),
+            Span::styled(title, Style::default().fg(theme.text_normal)),
+        ]),
+        Line::from(vec![
+            Span::styled("Artista: ", Style::default().fg(theme.text_dim)),
+            Span::styled(artist, Style::default().fg(theme.text_normal)),
+        ]),
+        Line::from(vec![
+            Span::styled("Album: ", Style::default().fg(theme.text_dim)),
+            Span::styled(album, Style::default().fg(theme.text_normal)),
+        ]),
+        Line::from(vec![
+            Span::styled("Genero: ", Style::default().fg(theme.text_dim)),
+            Span::styled(genre, Style::default().fg(theme.text_normal)),
+        ]),
+        Line::from(vec![
+            Span::styled("Tiempo: ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                format!("{} / {}", elapsed_text, total_text),
+                Style::default().fg(theme.text_normal),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Loop: ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                if player.loop_enabled() { "ON" } else { "OFF" },
+                Style::default().fg(theme.text_normal),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Espectro: ", Style::default().fg(theme.text_dim)),
+            Span::styled(spectrum, Style::default().fg(theme.text_accent)),
+        ]),
+        Line::from(""),
+        Line::from("Formatos compatibles: mp3, wav, flac, ogg, m4a, aac, opus"),
+    ]);
+
+    let body = Paragraph::new(body_text)
+        .style(Style::default().fg(theme.panel_fg).bg(theme.panel_bg))
+        .block(Block::default().borders(Borders::ALL).title("Audio"));
+    frame.render_widget(body, body_layout[0]);
+
+    let current_idx = player.current_track_index();
+    let playlist_items = player
+        .playlist_track_names()
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let style = if idx == current_idx {
+                Style::default().bg(theme.selected_bg).fg(theme.selected_fg)
+            } else {
+                Style::default().fg(theme.panel_fg).bg(theme.panel_bg)
+            };
+
+            ListItem::new(format!("{:>2}. {}", idx + 1, name)).style(style)
+        })
+        .collect::<Vec<_>>();
+
+    let playlist = List::new(playlist_items)
+        .style(Style::default().fg(theme.panel_fg).bg(theme.panel_bg))
+        .block(Block::default().borders(Borders::ALL).title("Playlist"));
+    frame.render_widget(playlist, body_layout[1]);
+
+    let footer = Paragraph::new(format!(
+        "F1 Ayuda F3/Esc Volver Espacio Pausa/Reanuda S Stop R Reiniciar ↑/↓ o N/P Tema ←/→ Seek 10s L Loop | {}",
+        status_message
+    ))
+    .style(Style::default().fg(theme.status_fg))
+    .block(Block::default().borders(Borders::ALL).title("Estado"));
+    frame.render_widget(footer, layout[2]);
+}
+
+fn build_spectrum_line(columns: usize, t: f64, active: bool, seed: usize) -> String {
+    let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut output = String::with_capacity(columns);
+    let base_gain = if active { 1.0 } else { 0.2 };
+    let seed = seed as f64 * 0.17;
+
+    for i in 0..columns {
+        let x = i as f64;
+        let wave_a = ((x * 0.22 + t * 2.4 + seed).sin() * 0.5) + 0.5;
+        let wave_b = ((x * 0.11 - t * 1.6 + seed * 0.7).cos() * 0.5) + 0.5;
+        let wave_c = ((x * 0.31 + t * 0.8).sin() * 0.5) + 0.5;
+        let combined = ((wave_a * 0.5) + (wave_b * 0.35) + (wave_c * 0.15)) * base_gain;
+        let idx = (combined * (levels.len() as f64 - 1.0)).round() as usize;
+        output.push(levels[idx.min(levels.len() - 1)]);
+    }
+
+    output
+}
+
 fn render_confirmation(frame: &mut Frame, app: &App) {
     let Some(message) = app.confirmation_message() else {
         return;
@@ -1125,6 +1387,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F2  Buscar archivos desde el directorio activo",
         "F3  Visualizar archivo de texto/markdown",
         "F4  Editar el archivo activo",
+        "M   Abrir playlist de audio de la carpeta del archivo seleccionado",
         "H  Alternar archivos ocultos",
         "F5  Copiar al panel opuesto (con confirmacion)",
         "F6  Enter mueve al panel opuesto; escribir cambia nombre",
@@ -1143,6 +1406,8 @@ fn render_help(frame: &mut Frame, app: &App) {
         "Espacio marca/desmarca seleccion",
         "Enter abre directorio o selecciona archivo en su carpeta",
         "F3 ver archivo de texto en resultados",
+        "F3 en audio: reproduce solo el archivo seleccionado",
+        "M en audio: abre/reabre reproductor; misma carpeta continua, carpeta nueva recarga playlist",
         "Usa comodines: *.rs, foo*bar",
         "Backspace sube al directorio padre o cierra busqueda",
         "",
