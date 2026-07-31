@@ -28,6 +28,66 @@ fn text_with_blinking_cursor<'a>(input: &'a str, tick: u64, theme: &ThemeColors)
     ])
 }
 
+fn fit_suffix(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let keep = max_chars - 3;
+    let start = chars.len().saturating_sub(keep);
+    let mut out = String::from("...");
+    out.extend(chars[start..].iter());
+    out
+}
+
+fn marquee_window(text: &str, width: usize, tick: u64) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return " ".repeat(width);
+    }
+
+    if chars.len() <= width {
+        let mut out: String = chars.iter().collect();
+        let missing = width.saturating_sub(out.chars().count());
+        if missing > 0 {
+            out.push_str(&" ".repeat(missing));
+        }
+        return out;
+    }
+
+    let gap = [' ', ' ', ' '];
+    let mut cycle = chars.clone();
+    cycle.extend(gap);
+
+    let pause_ticks = 24usize;
+    let phase_len = cycle.len() + pause_ticks;
+    let phase_pos = (tick as usize) % phase_len;
+    let offset = if phase_pos >= cycle.len() {
+        cycle.len().saturating_sub(1)
+    } else {
+        phase_pos
+    };
+
+    let mut out = String::with_capacity(width);
+    for i in 0..width {
+        out.push(cycle[(offset + i) % cycle.len()]);
+    }
+    out
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     if let AppMode::Viewer(viewer) = &app.mode {
         render_viewer(frame, viewer, &app.status_message, &app.theme, app.marquee_tick);
@@ -122,14 +182,26 @@ pub fn render(frame: &mut Frame, app: &App) {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
-    let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F4 Editar M Playlist F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar H Ocultos Esc Cancela copia F10 Salir | {}",
+    let fixed_prefix = format!(
+        "{} | {} | usuario: {} | marcados: {} | ",
         current.cwd.display(),
         now,
         username,
         current.marked_count(),
+    );
+    let moving_text = format!(
+        "F1 Ayuda F2 Buscar F3 Ver F4 Editar M Playlist F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar H Ocultos Esc Cancela copia F10 Salir | {}",
         app.status_message
     );
+
+    let footer_inner_width = layout[2].width.saturating_sub(2) as usize;
+    let min_marquee_width = 28usize.min(footer_inner_width);
+    let max_fixed_width = footer_inner_width.saturating_sub(min_marquee_width);
+    let fixed_visible = fit_suffix(&fixed_prefix, max_fixed_width);
+    let marquee_width = footer_inner_width.saturating_sub(fixed_visible.chars().count());
+    let moving_visible = marquee_window(&moving_text, marquee_width, app.marquee_tick);
+    let footer_text = format!("{}{}", fixed_visible, moving_visible);
+
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(app.theme.status_fg).bg(app.theme.panel_bg))
         .block(Block::default().borders(Borders::ALL).title("Estado"));
@@ -1053,7 +1125,7 @@ fn render_audio_player(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Espacio pausar/reanudar | S detener | R reiniciar | ↑/↓ o N/P siguiente/anterior | ←/→ seek | L loop on/off | Esc/F3 volver"),
+                .title("Espacio pausar/reanudar | S detener | R reiniciar | ↑/↓ o N/P siguiente/anterior | ←/→ seek | L loop on/off | Esc/F3/M volver"),
         );
     frame.render_widget(header, layout[0]);
 
@@ -1178,7 +1250,7 @@ fn render_audio_player(
     frame.render_widget(playlist, body_layout[1]);
 
     let footer = Paragraph::new(format!(
-        "F1 Ayuda F3/Esc Volver Espacio Pausa/Reanuda S Stop R Reiniciar ↑/↓ o N/P Tema ←/→ Seek 10s L Loop | {}",
+        "F1 Ayuda F3/Esc/M Volver Espacio Pausa/Reanuda S Stop R Reiniciar ↑/↓ o N/P Tema ←/→ Seek 10s L Loop | {}",
         status_message
     ))
     .style(Style::default().fg(theme.status_fg))

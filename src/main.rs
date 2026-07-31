@@ -64,7 +64,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<std:
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(Duration::from_millis(33))? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key)?,
                 Event::Mouse(mouse) => {

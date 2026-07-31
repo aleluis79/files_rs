@@ -9,8 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
         mpsc::{Receiver, TryRecvError},
     },
-    time::Instant,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -403,6 +402,7 @@ pub struct App {
     pub mode: AppMode,
     pub panel_page_size: usize,
     pub marquee_tick: u64,
+    marquee_last_step: Instant,
     pub show_help: bool,
     pub show_capibara: bool,
     pub rename_input: Option<RenameInputDialog>,
@@ -425,6 +425,7 @@ pub struct App {
     pub active_audio_cache: Option<RemoteAudioCacheState>,
     pub background_audio: Option<AudioPlayerState>,
     pub background_audio_folder_key: Option<String>,
+    pub background_audio_is_playlist: bool,
     pub audio_cache_dir: PathBuf,
     pub theme: ThemeColors,
 }
@@ -485,6 +486,7 @@ impl App {
             mode: AppMode::Panels,
             panel_page_size: 10,
             marquee_tick: 0,
+            marquee_last_step: Instant::now(),
             show_help: false,
             show_capibara: false,
             rename_input: None,
@@ -507,6 +509,7 @@ impl App {
             active_audio_cache: None,
             background_audio: None,
             background_audio_folder_key: None,
+            background_audio_is_playlist: false,
             audio_cache_dir,
             theme,
         })
@@ -1206,7 +1209,13 @@ impl App {
     }
 
     pub fn advance_marquee(&mut self) {
-        self.marquee_tick = self.marquee_tick.wrapping_add(1);
+        let step = Duration::from_millis(150);
+        let now = Instant::now();
+
+        if now.duration_since(self.marquee_last_step) >= step {
+            self.marquee_tick = self.marquee_tick.wrapping_add(1);
+            self.marquee_last_step = now;
+        }
     }
 
     pub fn exit_directory(&self) -> PathBuf {
@@ -1884,7 +1893,9 @@ impl App {
         }
 
         let folder_key = Self::folder_key_for_local_path(&path);
-        if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str()) {
+        if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str())
+            && self.background_audio_is_playlist
+        {
             self.mode = AppMode::AudioPlayer;
             self.status_message = "Reproductor reabierto (misma playlist)".to_string();
             return true;
@@ -1912,7 +1923,9 @@ impl App {
         match backend {
             PanelBackend::Local => {
                 let folder_key = Self::folder_key_for_local_path(&path);
-                if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str()) {
+                if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str())
+                    && self.background_audio_is_playlist
+                {
                     self.mode = AppMode::AudioPlayer;
                     self.status_message = "Reproductor reabierto (misma playlist)".to_string();
                     return true;
@@ -1922,7 +1935,9 @@ impl App {
             }
             PanelBackend::Remote { connection_name } => {
                 let folder_key = Self::folder_key_for_remote_path(&connection_name, &path);
-                if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str()) {
+                if self.background_audio_folder_key.as_deref() == Some(folder_key.as_str())
+                    && self.background_audio_is_playlist
+                {
                     self.mode = AppMode::AudioPlayer;
                     self.status_message = "Reproductor reabierto (misma playlist)".to_string();
                     return true;
@@ -2083,6 +2098,7 @@ impl App {
             Ok(player) => {
                 self.background_audio = Some(player);
                 self.background_audio_folder_key = Some(folder_key);
+                self.background_audio_is_playlist = false;
                 self.mode = AppMode::AudioPlayer;
                 self.status_message = format!("Reproduciendo: {}", label);
             }
@@ -2098,6 +2114,7 @@ impl App {
                 let total = player.total_tracks();
                 self.background_audio = Some(player);
                 self.background_audio_folder_key = Some(folder_key);
+                self.background_audio_is_playlist = true;
                 self.mode = AppMode::AudioPlayer;
                 self.status_message = format!("Playlist iniciada ({total} temas): {label}");
             }
@@ -2112,7 +2129,7 @@ impl App {
             KeyCode::F(1) => {
                 self.show_help = true;
             }
-            KeyCode::Esc | KeyCode::F(3) => {
+            KeyCode::Esc | KeyCode::F(3) | KeyCode::Char('m') | KeyCode::Char('M') => {
                 self.mode = AppMode::Panels;
                 self.status_message = "Reproductor en segundo plano".to_string();
             }
