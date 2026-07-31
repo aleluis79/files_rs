@@ -707,7 +707,7 @@ impl App {
                 let panel = self.active_panel();
                 self.status_message = format!("Orden: {} {}", panel.sort_mode.label(), panel.sort_order.symbol());
             }
-            KeyCode::F(4) => {
+            KeyCode::Char('h') | KeyCode::Char('H') => {
                 let show_hidden = {
                     let panel = self.active_panel_mut();
                     panel.show_hidden = !panel.show_hidden;

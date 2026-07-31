@@ -105,7 +105,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "desconocido".to_string());
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     let footer_text = format!(
-        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar F4 Ocultos Esc Cancela copia F10 Salir | {}",
+        "{} | {} | usuario: {} | marcados: {} | F1 Ayuda F2 Buscar F3 Ver F5 Copiar F6 Renombrar F7 Mkdir F8 Borrar F9 Orden F12 SCP Shift+F12 Desconectar H Ocultos Esc Cancela copia F10 Salir | {}",
         current.cwd.display(),
         now,
         username,
@@ -925,7 +925,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F1  Ayuda",
         "F2  Buscar archivos desde el directorio activo",
         "F3  Visualizar archivo de texto/markdown",
-        "F4  Alternar archivos ocultos",
+        "H  Alternar archivos ocultos",
         "F5  Copiar al panel opuesto (con confirmacion)",
         "F6  Enter mueve al panel opuesto; escribir cambia nombre",
         "F7  Crear directorio (con entrada y confirmacion)",
