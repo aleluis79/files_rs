@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 use lofty::{file::TaggedFileExt, prelude::Accessor, probe::Probe};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
+#[cfg(target_os = "linux")]
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioPlaybackStatus {
     Playing,
@@ -82,6 +85,7 @@ impl AudioPlayerState {
         current_index: usize,
         loop_enabled: bool,
     ) -> Result<Self> {
+        let (sink, player) = Self::build_player()?;
         let playlist_labels = playlist
             .iter()
             .map(|path| display_label_for_track(path))
@@ -96,9 +100,8 @@ impl AudioPlayerState {
             loop_enabled,
             current_duration: None,
             metadata: SongMetadata::default(),
-            _sink: DeviceSinkBuilder::open_default_sink()
-                .context("No se pudo abrir el dispositivo de audio por defecto")?,
-            player: Player::new().0,
+            _sink: sink,
+            player,
         };
         state._sink.log_on_drop(false);
         state.load_current_track()?;
@@ -106,7 +109,7 @@ impl AudioPlayerState {
     }
 
     fn build_player() -> Result<(MixerDeviceSink, Player)> {
-        let mut sink = DeviceSinkBuilder::open_default_sink()
+        let mut sink = open_preferred_sink()
             .context("No se pudo abrir el dispositivo de audio por defecto")?;
         sink.log_on_drop(false);
         let player = Player::connect_new(&sink.mixer());
@@ -116,18 +119,17 @@ impl AudioPlayerState {
 
     fn load_current_track(&mut self) -> Result<()> {
         let path = self.playlist[self.current_index].clone();
-        let (sink, player) = Self::build_player()?;
-
         let file = File::open(&path)
             .with_context(|| format!("No se pudo abrir {}", path.display()))?;
         let source = Decoder::try_from(file)
             .with_context(|| format!("Formato de audio no soportado para {}", path.display()))?;
+
+        self.player.stop();
+        self.player = Player::connect_new(&self._sink.mixer());
         self.current_duration = source.total_duration();
-        player.append(source);
+        self.player.append(source);
         self.metadata = read_song_metadata(&path);
 
-        self._sink = sink;
-        self.player = player;
         self.path = path;
         self.status = AudioPlaybackStatus::Playing;
         Ok(())
@@ -321,6 +323,78 @@ pub fn is_supported_audio_path(path: &Path) -> bool {
         "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus"
     )
 }
+
+fn open_preferred_sink() -> Result<MixerDeviceSink> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(sink) = open_linux_non_jack_sink() {
+            return Ok(sink);
+        }
+
+        return DeviceSinkBuilder::from_default_device()
+            .map(configure_linux_sink_builder)
+            .and_then(|builder| builder.open_sink_or_fallback())
+            .context("No se pudo abrir el dispositivo de audio por defecto");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        DeviceSinkBuilder::open_default_sink()
+            .context("No se pudo abrir el dispositivo de audio por defecto")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_non_jack_sink() -> Result<MixerDeviceSink> {
+    let host = rodio::cpal::default_host();
+    let mut fallback = None;
+
+    for device in host
+        .output_devices()
+        .context("No se pudo listar dispositivos de salida")?
+    {
+        let name = device
+            .description()
+            .map(|description| description.name().to_string())
+            .unwrap_or_default();
+        let lowered = name.to_ascii_lowercase();
+
+        if lowered.contains("jack") || lowered.contains("null") {
+            continue;
+        }
+
+        if lowered.contains("pulse") || lowered.contains("pipewire") {
+            return DeviceSinkBuilder::from_device(device)
+                .map(configure_linux_sink_builder)
+                .and_then(|builder| builder.open_sink_or_fallback())
+                .with_context(|| format!("No se pudo abrir dispositivo preferido: {name}"));
+        }
+
+        if fallback.is_none() {
+            fallback = Some(device);
+        }
+    }
+
+    let device = fallback.ok_or_else(|| anyhow::anyhow!("No hay salida de audio disponible"))?;
+    DeviceSinkBuilder::from_device(device)
+        .map(configure_linux_sink_builder)
+        .and_then(|builder| builder.open_sink_or_fallback())
+        .context("No se pudo abrir un dispositivo de audio alternativo")
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_sink_builder(
+    builder: DeviceSinkBuilder,
+) -> DeviceSinkBuilder<fn(rodio::cpal::StreamError)> {
+    builder
+        // En WSL los buffers mas grandes reducen underruns transitorios.
+        .with_buffer_size(rodio::cpal::BufferSize::Fixed(4096))
+        // Evita que cpal escriba errores transitorios por stderr sobre la TUI.
+        .with_error_callback(ignore_stream_error)
+}
+
+#[cfg(target_os = "linux")]
+fn ignore_stream_error(_: rodio::cpal::StreamError) {}
 
 #[cfg(test)]
 mod tests {

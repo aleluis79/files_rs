@@ -21,6 +21,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::app::App;
 
 fn main() -> Result<()> {
+    suppress_alsa_stderr_noise();
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal);
     restore_terminal(&mut terminal)?;
@@ -97,3 +98,23 @@ fn shell_quote(path: &Path) -> String {
     let raw = path.display().to_string();
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
+
+#[cfg(target_os = "linux")]
+fn suppress_alsa_stderr_noise() {
+    unsafe extern "C" fn no_op_alsa_error_handler(
+        _file: *const std::ffi::c_char,
+        _line: std::ffi::c_int,
+        _func: *const std::ffi::c_char,
+        _err: std::ffi::c_int,
+        _fmt: *const std::ffi::c_char,
+        _arg: *mut alsa_sys::__va_list_tag,
+    ) {
+    }
+
+    unsafe {
+        let _ = alsa_sys::snd_lib_error_set_local(Some(no_op_alsa_error_handler));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn suppress_alsa_stderr_noise() {}
