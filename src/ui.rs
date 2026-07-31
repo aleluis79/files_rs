@@ -30,7 +30,7 @@ fn text_with_blinking_cursor<'a>(input: &'a str, tick: u64, theme: &ThemeColors)
 
 pub fn render(frame: &mut Frame, app: &App) {
     if let AppMode::Viewer(viewer) = &app.mode {
-        render_viewer(frame, viewer, &app.status_message, &app.theme);
+        render_viewer(frame, viewer, &app.status_message, &app.theme, app.marquee_tick);
         render_mkdir_input(frame, app);
         render_rename_input(frame, app);
         render_search_input(frame, app);
@@ -679,7 +679,124 @@ fn syntax_highlight_line(line: &str, extension: &str, theme: &ThemeColors) -> Ve
     spans
 }
 
-fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, theme: &ThemeColors) {
+fn push_rendered_segment(
+    spans: &mut Vec<Span<'static>>,
+    segment: &str,
+    selected: bool,
+    extension: &str,
+    theme: &ThemeColors,
+) {
+    if segment.is_empty() {
+        return;
+    }
+
+    if selected {
+        spans.push(Span::styled(
+            segment.to_string(),
+            Style::default().bg(theme.selected_bg).fg(theme.selected_fg),
+        ));
+    } else {
+        spans.extend(syntax_highlight_line(segment, extension, theme));
+    }
+}
+
+fn render_editor_line(
+    line: &str,
+    cursor_col: usize,
+    extension: &str,
+    theme: &ThemeColors,
+    is_cursor_line: bool,
+    tick: u64,
+    selection_range: Option<(usize, usize)>,
+) -> Line<'static> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let char_count = chars.len();
+    let cursor_col = cursor_col.min(char_count);
+
+    let selection_start = selection_range.map(|(start, _)| start).unwrap_or(usize::MAX);
+    let selection_end = selection_range.map(|(_, end)| end).unwrap_or(0);
+
+    let mut spans = Vec::new();
+    let mut current_segment = String::new();
+    let mut current_selected = false;
+    let mut cursor_inserted = false;
+
+    for (idx, ch) in chars.iter().enumerate() {
+        if is_cursor_line && idx == cursor_col && !cursor_inserted {
+            if !current_segment.is_empty() {
+                push_rendered_segment(
+                    &mut spans,
+                    &current_segment,
+                    current_selected,
+                    extension,
+                    theme,
+                );
+                current_segment.clear();
+            }
+
+            let cursor_style = if tick % 2 == 0 {
+                Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim)
+            };
+            spans.push(Span::styled("▌", cursor_style));
+            cursor_inserted = true;
+        }
+
+        let selected = selection_range.is_some() && selection_start <= idx && idx < selection_end;
+        if selected != current_selected {
+            if !current_segment.is_empty() {
+                push_rendered_segment(
+                    &mut spans,
+                    &current_segment,
+                    current_selected,
+                    extension,
+                    theme,
+                );
+                current_segment.clear();
+            }
+            current_selected = selected;
+        }
+
+        current_segment.push(*ch);
+    }
+
+    if !current_segment.is_empty() {
+        push_rendered_segment(&mut spans, &current_segment, current_selected, extension, theme);
+    }
+
+    if is_cursor_line && !cursor_inserted && cursor_col == char_count {
+        let cursor_style = if tick % 2 == 0 {
+            Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        spans.push(Span::styled("▌", cursor_style));
+    }
+
+    if spans.is_empty() {
+        return Line::from(vec![Span::raw("")]);
+    }
+
+    Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_editor_line_highlights_the_selected_range_on_the_cursor_line() {
+        let theme = ThemeColors::dark();
+        let line = render_editor_line("abc", 1, "", &theme, true, 0, Some((1, 2)));
+
+        assert!(line.spans.iter().any(|span| {
+            span.content.contains('b') && span.style.bg == Some(theme.selected_bg)
+        }));
+    }
+}
+
+fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, theme: &ThemeColors, tick: u64) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -689,7 +806,7 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, 
         ])
         .split(frame.area());
 
-    let header = Paragraph::new(format!("Visor: {}", viewer.path.display()))
+    let header = Paragraph::new(format!("{}: {}", if viewer.is_editing() { "Editor" } else { "Visor" }, viewer.path.display()))
         .style(
             Style::default()
                 .fg(theme.header_fg)
@@ -698,7 +815,7 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, 
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("F3 / Esc para volver"),
+                .title(if viewer.is_editing() { "F4 / Enter / Backspace editar | Esc/F3 guardar o descartar" } else { "F3 / Esc para volver | F4 editar" }),
         );
     frame.render_widget(header, layout[0]);
 
@@ -725,7 +842,50 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, 
                 format!("{:>4} ", offset + index + 1),
                 Style::default().fg(theme.text_dim),
             ));
-            spans.extend(syntax_highlight_line(line, &extension, theme));
+            let is_cursor_line = viewer.is_editing() && offset + index == viewer.cursor.0;
+            let cursor_col = if is_cursor_line { viewer.cursor.1 } else { 0 };
+            let visible_line = if viewer.scroll_x > 0 {
+                line.chars().skip(viewer.scroll_x).collect::<String>()
+            } else {
+                line.clone()
+            };
+            let selection_range = viewer.selection_anchor.and_then(|anchor| {
+                let cursor = viewer.cursor;
+                if anchor == cursor {
+                    None
+                } else {
+                    let (start, end) = if (anchor.0, anchor.1) <= (cursor.0, cursor.1) {
+                        (anchor, cursor)
+                    } else {
+                        (cursor, anchor)
+                    };
+                    if start.0 == offset + index && start.0 == end.0 {
+                        Some((start.1, end.1))
+                    } else if start.0 == offset + index {
+                        Some((start.1, line.chars().count()))
+                    } else if end.0 == offset + index {
+                        Some((0, end.1))
+                    } else if start.0 < offset + index && offset + index < end.0 {
+                        Some((0, line.chars().count()))
+                    } else {
+                        None
+                    }
+                }
+            });
+            let line_with_cursor = render_editor_line(
+                &visible_line,
+                if is_cursor_line {
+                    cursor_col.saturating_sub(viewer.scroll_x)
+                } else {
+                    0
+                },
+                &extension,
+                theme,
+                is_cursor_line,
+                tick,
+                selection_range,
+            );
+            spans.extend(line_with_cursor.spans);
             Line::from(spans)
         })
         .collect::<Vec<_>>();
@@ -734,7 +894,7 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, 
     frame.render_widget(body, layout[1]);
 
     let footer = Paragraph::new(format!(
-        "linea {} de {} | F1 Ayuda F3/Esc Volver | {}",
+        "linea {} de {} | F1 Ayuda F3/Esc Volver F4 Editar | {}",
         offset.saturating_add(1),
         viewer.lines.len(),
         status_message
@@ -925,6 +1085,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         "F1  Ayuda",
         "F2  Buscar archivos desde el directorio activo",
         "F3  Visualizar archivo de texto/markdown",
+        "F4  Editar el archivo activo",
         "H  Alternar archivos ocultos",
         "F5  Copiar al panel opuesto (con confirmacion)",
         "F6  Enter mueve al panel opuesto; escribir cambia nombre",

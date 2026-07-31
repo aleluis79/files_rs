@@ -69,7 +69,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<std:
                     app.handle_mouse(mouse, left_width);
                 }
                 Event::Resize(_, _) => {}
-                Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::FocusGained | Event::FocusLost => {}
+                Event::Paste(data) => app.handle_paste(data)?,
             }
         }
     }

@@ -415,6 +415,7 @@ pub struct App {
     pub exit_dir: Option<PathBuf>,
     pub should_quit: bool,
     pub status_message: String,
+    pub pending_viewer_exit: bool,
     pub config_store: ConfigStore,
     pub remote_sessions: HashMap<String, RemoteSession>,
     pub active_transfer: Option<TransferState>,
@@ -459,6 +460,7 @@ impl App {
             exit_dir: None,
             should_quit: false,
             status_message: "Listo".to_string(),
+            pending_viewer_exit: false,
             config_store,
             remote_sessions: HashMap::new(),
             active_transfer: None,
@@ -657,6 +659,7 @@ impl App {
             KeyCode::Backspace => self.go_parent()?,
             KeyCode::Char(' ') => self.active_panel_mut().toggle_mark(),
             KeyCode::F(3) => self.preview_selected(),
+            KeyCode::F(4) => self.edit_selected(),
             KeyCode::F(5) => {
                 if self.active_transfer.is_some() {
                     self.status_message = "Espera a que termine la transferencia actual".to_string();
@@ -1454,6 +1457,7 @@ impl App {
             KeyCode::PageDown => self.move_search_selection(self.panel_step() as isize),
             KeyCode::Enter => self.open_search_selected()?,
             KeyCode::F(3) => self.open_search_selected_preview(),
+            KeyCode::F(4) => self.open_search_selected_edit(),
             KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
             _ => {}
         }
@@ -1530,6 +1534,14 @@ impl App {
     }
 
     fn open_search_selected_preview(&mut self) {
+        self.open_search_selected_viewer(false);
+    }
+
+    fn open_search_selected_edit(&mut self) {
+        self.open_search_selected_viewer(true);
+    }
+
+    fn open_search_selected_viewer(&mut self, editing: bool) {
         let state = match std::mem::replace(&mut self.mode, AppMode::Panels) {
             AppMode::Search(state) => state,
             other => {
@@ -1542,17 +1554,22 @@ impl App {
         if let Some(entry) = selected_entry {
             if entry.is_dir {
                 self.mode = AppMode::Search(state);
-                self.status_message = format!("{} es un directorio; F3 solo abre archivos de texto", entry.name);
+                self.status_message = format!("{} es un directorio; F3/F4 solo abren archivos de texto", entry.name);
                 return;
             }
             match ViewerState::open(&entry.path) {
-                Ok(viewer) => {
+                Ok(mut viewer) => {
+                    if editing {
+                        viewer.enter_edit_mode();
+                        self.status_message = format!("Editando: {}", entry.name);
+                    } else {
+                        self.status_message = format!("Visualizando: {}", entry.name);
+                    }
                     self.mode = AppMode::Viewer(viewer);
-                    self.status_message = format!("Visualizando: {}", entry.name);
                 }
                 Err(error) => {
                     self.mode = AppMode::Search(state);
-                    self.status_message = format!("No se puede visualizar {}: {error}", entry.name);
+                    self.status_message = format!("No se puede abrir {}: {error}", entry.name);
                 }
             }
         } else {
@@ -1561,11 +1578,19 @@ impl App {
     }
 
     fn preview_selected(&mut self) {
+        self.open_selected_viewer(false);
+    }
+
+    fn edit_selected(&mut self) {
+        self.open_selected_viewer(true);
+    }
+
+    fn open_selected_viewer(&mut self, editing: bool) {
         let selected = self.active_panel().selected_entry().cloned();
         if let Some(entry) = selected {
             if entry.is_dir {
                 self.status_message = format!(
-                    "{} es un directorio; F3 solo abre archivos de texto",
+                    "{} es un directorio; F3/F4 solo abren archivos de texto",
                     entry.name
                 );
                 return;
@@ -1591,12 +1616,17 @@ impl App {
             };
 
             match result {
-                Ok(viewer) => {
+                Ok(mut viewer) => {
+                    if editing {
+                        viewer.enter_edit_mode();
+                        self.status_message = format!("Editando: {}", entry.name);
+                    } else {
+                        self.status_message = format!("Visualizando: {}", entry.name);
+                    }
                     self.mode = AppMode::Viewer(viewer);
-                    self.status_message = format!("Visualizando: {}", entry.name);
                 }
                 Err(error) => {
-                    self.status_message = format!("No se puede visualizar {}: {error}", entry.name);
+                    self.status_message = format!("No se puede abrir {}: {error}", entry.name);
                 }
             }
         }
@@ -1607,35 +1637,247 @@ impl App {
             KeyCode::F(1) => {
                 self.show_help = true;
             }
-            KeyCode::Esc | KeyCode::F(3) | KeyCode::Backspace => {
+            KeyCode::F(3) => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        if self.pending_viewer_exit {
+                            self.pending_viewer_exit = false;
+                            viewer.discard_edit();
+                            self.mode = AppMode::Panels;
+                            self.status_message = "Cambios descartados y volviendo a paneles".to_string();
+                            return Ok(());
+                        }
+
+                        if viewer.is_dirty() {
+                            self.pending_viewer_exit = true;
+                            self.status_message = "Guardar cambios? Enter=guardar, Esc=descartar".to_string();
+                            return Ok(());
+                        }
+
+                        viewer.discard_edit();
+                        self.mode = AppMode::Panels;
+                        self.status_message = "Cambios descartados y volviendo a paneles".to_string();
+                        return Ok(());
+                    }
+                }
                 self.mode = AppMode::Panels;
                 self.status_message = "Volviendo a paneles".to_string();
             }
+            KeyCode::Esc => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        if self.pending_viewer_exit {
+                            self.pending_viewer_exit = false;
+                            viewer.discard_edit();
+                            self.mode = AppMode::Panels;
+                            self.status_message = "Cambios descartados y volviendo a paneles".to_string();
+                            return Ok(());
+                        }
+
+                        if viewer.is_dirty() {
+                            self.pending_viewer_exit = true;
+                            self.status_message = "Guardar cambios? Enter=guardar, Esc=descartar".to_string();
+                            return Ok(());
+                        }
+
+                        viewer.discard_edit();
+                        self.mode = AppMode::Panels;
+                        self.status_message = "Cambios descartados y volviendo a paneles".to_string();
+                        return Ok(());
+                    }
+                }
+                self.mode = AppMode::Panels;
+                self.status_message = "Volviendo a paneles".to_string();
+            }
+            KeyCode::F(4) => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        self.status_message = "Ya estas editando este archivo".to_string();
+                    } else {
+                        viewer.enter_edit_mode();
+                        self.status_message = format!("Editando: {}", viewer.path.display());
+                    }
+                }
+            }
             KeyCode::Up => {
                 if let AppMode::Viewer(viewer) = &mut self.mode {
-                    viewer.scroll_up();
+                    if viewer.is_editing() {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            viewer.start_selection();
+                        } else {
+                            viewer.clear_selection();
+                        }
+                        viewer.move_cursor_up();
+                        viewer.ensure_cursor_visible(10, 20);
+                    } else {
+                        viewer.scroll_up();
+                    }
                 }
             }
             KeyCode::Down => {
                 if let AppMode::Viewer(viewer) = &mut self.mode {
-                    viewer.scroll_down();
+                    if viewer.is_editing() {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            viewer.start_selection();
+                        } else {
+                            viewer.clear_selection();
+                        }
+                        viewer.move_cursor_down();
+                        viewer.ensure_cursor_visible(10, 20);
+                    } else {
+                        viewer.scroll_down();
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            viewer.start_selection();
+                        } else {
+                            viewer.clear_selection();
+                        }
+                        viewer.move_cursor_left();
+                        viewer.ensure_cursor_visible(10, 20);
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            viewer.start_selection();
+                        } else {
+                            viewer.clear_selection();
+                        }
+                        viewer.move_cursor_right();
+                        viewer.ensure_cursor_visible(10, 20);
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        viewer.move_cursor_home();
+                        viewer.ensure_cursor_visible(10, 20);
+                    }
+                }
+            }
+            KeyCode::End => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        viewer.move_cursor_end();
+                        viewer.ensure_cursor_visible(10, 20);
+                    }
                 }
             }
             KeyCode::PageUp => {
                 if let AppMode::Viewer(viewer) = &mut self.mode {
-                    for _ in 0..10 {
-                        viewer.scroll_up();
+                    if viewer.is_editing() {
+                        for _ in 0..10 {
+                            viewer.move_cursor_up();
+                        }
+                        viewer.ensure_cursor_visible(10, 20);
+                    } else {
+                        for _ in 0..10 {
+                            viewer.scroll_up();
+                        }
                     }
                 }
             }
             KeyCode::PageDown => {
                 if let AppMode::Viewer(viewer) = &mut self.mode {
-                    for _ in 0..10 {
-                        viewer.scroll_down();
+                    if viewer.is_editing() {
+                        for _ in 0..10 {
+                            viewer.move_cursor_down();
+                        }
+                        viewer.ensure_cursor_visible(10, 20);
+                    } else {
+                        for _ in 0..10 {
+                            viewer.scroll_down();
+                        }
                     }
                 }
             }
-            KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
+            KeyCode::Enter => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if self.pending_viewer_exit {
+                        self.pending_viewer_exit = false;
+                        viewer.save_edit()?;
+                        self.mode = AppMode::Panels;
+                        self.status_message = "Cambios guardados y volviendo a paneles".to_string();
+                        return Ok(());
+                    }
+
+                    if viewer.is_editing() {
+                        viewer.insert_new_line();
+                        self.status_message = "Se agrego una nueva linea".to_string();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        if viewer.has_selection() {
+                            viewer.delete_selection();
+                        } else {
+                            viewer.delete_char();
+                        }
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() {
+                        if viewer.has_selection() {
+                            viewer.delete_selection();
+                        } else {
+                            viewer.delete_char_forward();
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if c == 'q' {
+                    self.open_confirmation(PendingAction::Quit);
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let AppMode::Viewer(viewer) = &mut self.mode {
+                        if viewer.is_editing() {
+                            match c.to_ascii_lowercase() {
+                                'c' => {
+                                    if viewer.copy_selection_to_clipboard().is_some() {
+                                        self.status_message = "Texto copiado".to_string();
+                                    } else {
+                                        self.status_message = "No hay texto seleccionado".to_string();
+                                    }
+                                }
+                                'v' => {
+                                    viewer.paste_from_clipboard();
+                                    if viewer.clipboard.is_some() {
+                                        self.status_message = "Texto pegado".to_string();
+                                    } else {
+                                        self.status_message = "No hay texto en el portapapeles".to_string();
+                                    }
+                                }
+                                'z' => {
+                                    viewer.undo();
+                                    self.status_message = "Deshacer".to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if let AppMode::Viewer(viewer) = &mut self.mode {
+                    if viewer.is_editing() && !c.is_control() {
+                        if viewer.has_selection() {
+                            viewer.delete_selection();
+                        }
+                        viewer.insert_char(c);
+                        self.status_message = "Editando contenido".to_string();
+                    }
+                }
+            }
+            KeyCode::F(10) => self.open_confirmation(PendingAction::Quit),
             _ => {}
         }
         Ok(())
@@ -1647,10 +1889,26 @@ impl App {
                 self.show_help = false;
                 self.status_message = "Ayuda cerrada".to_string();
             }
-            KeyCode::F(10) | KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
+            KeyCode::F(10) => self.open_confirmation(PendingAction::Quit),
+            KeyCode::Char('q') => self.open_confirmation(PendingAction::Quit),
             _ => {}
         }
 
+        Ok(())
+    }
+
+    pub fn handle_paste(&mut self, data: String) -> Result<()> {
+        if let AppMode::Viewer(viewer) = &mut self.mode {
+            if viewer.is_editing() {
+                if data.is_empty() {
+                    viewer.paste_from_clipboard();
+                    self.status_message = "Texto pegado".to_string();
+                } else {
+                    viewer.insert_text(&data);
+                    self.status_message = "Texto pegado".to_string();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2455,6 +2713,101 @@ fn is_ignored_search_dir(name: &str) -> bool {
 
 fn normalize_extension(ext: &str) -> String {
     ext.trim_start_matches('.').to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        env,
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn make_temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("files-rs-app-test-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn escaping_the_viewer_after_editing_discards_changes_when_requested() {
+        let temp_dir = make_temp_dir();
+        let previous_dir = env::current_dir().expect("current dir");
+        env::set_current_dir(&temp_dir).expect("set current dir");
+
+        let file_path = temp_dir.join("sample.txt");
+        fs::write(&file_path, "original\nline\n").expect("write sample file");
+
+        let mut app = App::new().expect("create app");
+        app.mode = AppMode::Viewer(ViewerState::open(&file_path).expect("open viewer"));
+
+        if let AppMode::Viewer(viewer) = &mut app.mode {
+            viewer.enter_edit_mode();
+            viewer.insert_char('x');
+        }
+
+        app.handle_viewer_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .expect("handle first escape");
+        assert!(app.pending_viewer_exit);
+
+        app.handle_viewer_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .expect("handle second escape");
+
+        assert!(matches!(app.mode, AppMode::Panels));
+        let saved = fs::read_to_string(&file_path).expect("read saved file");
+        assert_eq!(saved, "original\nline\n");
+
+        env::set_current_dir(previous_dir).expect("restore current dir");
+    }
+
+    #[test]
+    fn search_mode_f4_opens_the_selected_file_in_edit_mode() {
+        let temp_dir = make_temp_dir();
+        let previous_dir = env::current_dir().expect("current dir");
+        env::set_current_dir(&temp_dir).expect("set current dir");
+
+        let file_path = temp_dir.join("sample.txt");
+        fs::write(&file_path, "hello\nworld\n").expect("write sample file");
+
+        let mut app = App::new().expect("create app");
+        app.mode = AppMode::Search(SearchState {
+            root_dir: temp_dir.clone(),
+            query: "sample".to_string(),
+            pattern: "sample".to_string(),
+            file_type: None,
+            entries: vec![FileEntry {
+                name: "sample.txt".to_string(),
+                path: file_path.clone(),
+                is_dir: false,
+                is_executable: false,
+                size_bytes: Some(12),
+                modified: None,
+            }],
+            selected: 0,
+            pending_dirs: vec![],
+            processed_dirs: 0,
+            finished: true,
+        });
+
+        let key = KeyEvent::new(KeyCode::F(4), KeyModifiers::empty());
+        app.handle_search_key(key).expect("handle f4");
+
+        match &app.mode {
+            AppMode::Viewer(viewer) => {
+                assert!(viewer.is_editing());
+                assert_eq!(viewer.path, file_path);
+            }
+            _ => panic!("expected viewer mode"),
+        }
+
+        env::set_current_dir(previous_dir).expect("restore current dir");
+    }
 }
 
 fn matches_search(name: &str, path: &Path, is_dir: bool, is_executable: bool, pattern: &str, file_type: &Option<String>) -> bool {
