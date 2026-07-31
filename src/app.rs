@@ -1739,6 +1739,8 @@ impl App {
                         }
                         viewer.move_cursor_left();
                         viewer.ensure_cursor_visible(10, 20);
+                    } else {
+                        viewer.scroll_left();
                     }
                 }
             }
@@ -1752,6 +1754,8 @@ impl App {
                         }
                         viewer.move_cursor_right();
                         viewer.ensure_cursor_visible(10, 20);
+                    } else {
+                        viewer.scroll_right();
                     }
                 }
             }

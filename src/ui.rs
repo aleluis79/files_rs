@@ -893,12 +893,51 @@ fn render_viewer(frame: &mut Frame, viewer: &ViewerState, status_message: &str, 
     let body = Paragraph::new(content).block(Block::default().borders(Borders::ALL).title("Contenido"));
     frame.render_widget(body, layout[1]);
 
-    let footer = Paragraph::new(format!(
-        "linea {} de {} | F1 Ayuda F3/Esc Volver F4 Editar | {}",
-        offset.saturating_add(1),
-        viewer.lines.len(),
-        status_message
-    ))
+    let current_line = if viewer.is_editing() {
+        viewer.cursor.0.saturating_add(1)
+    } else {
+        0
+    };
+
+    let current_column = if viewer.is_editing() {
+        viewer.cursor.1.saturating_add(1)
+    } else {
+        0
+    };
+
+    let total_columns = if viewer.is_editing() {
+        viewer
+            .lines
+            .get(viewer.cursor.0)
+            .map(|line| line.chars().count().max(1))
+            .unwrap_or(1)
+    } else {
+        viewer
+            .lines
+            .first()
+            .map(|line| line.chars().count().max(1))
+            .unwrap_or(1)
+    };
+
+    let footer_text = if viewer.is_editing() {
+        format!(
+            "linea {} de {} | col {} de {} | F1 Ayuda F3/Esc Volver F4 Editar | {}",
+            current_line,
+            viewer.lines.len(),
+            current_column,
+            total_columns,
+            status_message
+        )
+    } else {
+        format!(
+            "lineas {} | cols {} | F1 Ayuda F3/Esc Volver F4 Editar | {}",
+            viewer.lines.len(),
+            total_columns,
+            status_message
+        )
+    };
+
+    let footer = Paragraph::new(footer_text)
     .style(Style::default().fg(theme.status_fg))
     .block(Block::default().borders(Borders::ALL).title("Estado"));
     frame.render_widget(footer, layout[2]);

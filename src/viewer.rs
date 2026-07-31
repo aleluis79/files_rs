@@ -61,6 +61,14 @@ impl ViewerState {
         self.scroll = self.scroll.saturating_add(1);
     }
 
+    pub fn scroll_left(&mut self) {
+        self.scroll_x = self.scroll_x.saturating_sub(1);
+    }
+
+    pub fn scroll_right(&mut self) {
+        self.scroll_x = self.scroll_x.saturating_add(1);
+    }
+
     pub fn is_editing(&self) -> bool {
         self.editing
     }
@@ -223,43 +231,45 @@ impl ViewerState {
         self.selection_anchor = None;
     }
 
-    pub fn move_cursor_left(&mut self) {
+    pub fn move_cursor_left(&mut self) -> bool {
         if !self.editing {
-            return;
+            return false;
         }
 
         let (line_idx, col_idx) = self.cursor;
         if col_idx > 0 {
             self.cursor.1 = col_idx.saturating_sub(1);
-            return;
-        }
-
-        if line_idx > 0 {
+            true
+        } else if line_idx > 0 {
             let previous_line = line_idx.saturating_sub(1);
             self.cursor = (previous_line, self.line_len_chars(previous_line));
+            true
+        } else {
+            false
         }
     }
 
-    pub fn move_cursor_right(&mut self) {
+    pub fn move_cursor_right(&mut self) -> bool {
         if !self.editing {
-            return;
+            return false;
         }
 
         let (line_idx, col_idx) = self.cursor;
         let line_len = self.line_len_chars(line_idx);
         if col_idx < line_len {
             self.cursor.1 = col_idx.saturating_add(1);
-            return;
-        }
-
-        if line_idx + 1 < self.lines.len() {
+            true
+        } else if line_idx + 1 < self.lines.len() {
             self.cursor = (line_idx + 1, 0);
+            true
+        } else {
+            false
         }
     }
 
-    pub fn move_cursor_up(&mut self) {
+    pub fn move_cursor_up(&mut self) -> bool {
         if !self.editing {
-            return;
+            return false;
         }
 
         let (line_idx, col_idx) = self.cursor;
@@ -267,12 +277,15 @@ impl ViewerState {
             let previous_line = line_idx.saturating_sub(1);
             let column = self.clamp_cursor_column(previous_line, col_idx);
             self.cursor = (previous_line, column);
+            true
+        } else {
+            false
         }
     }
 
-    pub fn move_cursor_down(&mut self) {
+    pub fn move_cursor_down(&mut self) -> bool {
         if !self.editing {
-            return;
+            return false;
         }
 
         let (line_idx, col_idx) = self.cursor;
@@ -280,22 +293,27 @@ impl ViewerState {
             let next_line = line_idx + 1;
             let column = self.clamp_cursor_column(next_line, col_idx);
             self.cursor = (next_line, column);
+            true
+        } else {
+            false
         }
     }
 
-    pub fn move_cursor_home(&mut self) {
+    pub fn move_cursor_home(&mut self) -> bool {
         if !self.editing {
-            return;
+            return false;
         }
         self.cursor.1 = 0;
+        true
     }
 
-    pub fn move_cursor_end(&mut self) {
+    pub fn move_cursor_end(&mut self) -> bool {
         if !self.editing {
-            return;
+            return false;
         }
         let line_idx = self.cursor.0;
         self.cursor.1 = self.line_len_chars(line_idx);
+        true
     }
 
     pub fn ensure_cursor_visible(&mut self, viewport_height: usize, viewport_width: usize) {
@@ -312,6 +330,9 @@ impl ViewerState {
         } else if self.cursor.0 > bottom {
             self.scroll = self.cursor.0.saturating_sub(viewport_height.saturating_sub(1));
         }
+
+        let max_offset = self.lines.len().saturating_sub(viewport_height.max(1));
+        self.scroll = self.scroll.min(max_offset);
 
         let viewport_width = viewport_width.max(1);
         let margin = 3usize;
@@ -532,6 +553,21 @@ mod tests {
     }
 
     #[test]
+    fn cursor_does_not_move_past_the_last_line_of_the_document() {
+        let path = make_temp_file("abc\ndef\n");
+        let mut viewer = ViewerState::open(&path).expect("open viewer file");
+
+        viewer.enter_edit_mode();
+        viewer.lines = vec!["abc".to_string(), "def".to_string()];
+        viewer.cursor = (1, 3);
+
+        viewer.move_cursor_right();
+        viewer.move_cursor_down();
+
+        assert_eq!(viewer.cursor, (1, 3));
+    }
+
+    #[test]
     fn cursor_movement_updates_the_scroll_offset_when_the_cursor_leaves_the_visible_window() {
         let path = make_temp_file("line 1\nline 2\nline 3\nline 4\nline 5\n");
         let mut viewer = ViewerState::open(&path).expect("open viewer file");
@@ -555,6 +591,23 @@ mod tests {
     }
 
     #[test]
+    fn moving_down_at_the_last_line_keeps_the_scroll_offset_stable() {
+        let path = make_temp_file("line 1\nline 2\nline 3\nline 4\nline 5\n");
+        let mut viewer = ViewerState::open(&path).expect("open viewer file");
+
+        viewer.enter_edit_mode();
+        viewer.lines = vec!["line 1".to_string(), "line 2".to_string(), "line 3".to_string(), "line 4".to_string(), "line 5".to_string()];
+        viewer.cursor = (4, 0);
+        viewer.scroll = 0;
+
+        let moved = viewer.move_cursor_down();
+        viewer.ensure_cursor_visible(5, 10);
+
+        assert!(!moved);
+        assert_eq!(viewer.scroll, 0);
+    }
+
+    #[test]
     fn cursor_movement_updates_the_horizontal_scroll_offset_when_the_cursor_leaves_the_visible_window() {
         let path = make_temp_file("line 1\n");
         let mut viewer = ViewerState::open(&path).expect("open viewer file");
@@ -567,6 +620,18 @@ mod tests {
 
         assert_eq!(viewer.cursor, (0, 12));
         assert_eq!(viewer.scroll_x, 10);
+    }
+
+    #[test]
+    fn horizontal_scrolling_moves_the_viewport_offset_in_viewer_mode() {
+        let path = make_temp_file("hola\n");
+        let mut viewer = ViewerState::open(&path).expect("open viewer file");
+
+        viewer.scroll_right();
+        viewer.scroll_right();
+        viewer.scroll_left();
+
+        assert_eq!(viewer.scroll_x, 1);
     }
 
     #[test]
